@@ -1,0 +1,65 @@
+# GCP Configuration
+gcp:
+  project_id: ${GCP_PROJECT_ID}
+  temp_bucket: ${GCP_TEMP_BUCKET}
+
+# BigQuery Datasets Configuration
+datasets:
+  rdl:  # Raw Data Layer
+    - name: sales_rdl
+      tables:
+        - name: transactions
+          query: >
+            SELECT *
+            FROM `${GCP_PROJECT_ID}.sales_rdl.transactions`
+            WHERE DATE(transaction_date) = '{process_date}'
+        - name: customers
+          query: >
+            SELECT *
+            FROM `${GCP_PROJECT_ID}.sales_rdl.customers`
+            WHERE DATE(last_updated) = '{process_date}'
+    
+    - name: inventory_rdl
+      tables:
+        - name: stock_levels
+          query: >
+            SELECT *
+            FROM `${GCP_PROJECT_ID}.inventory_rdl.stock_levels`
+            WHERE DATE(update_time) = '{process_date}'
+        - name: products
+          query: >
+            SELECT *
+            FROM `${GCP_PROJECT_ID}.inventory_rdl.products`
+            WHERE DATE(modified_date) = '{process_date}'
+
+  reporting:  # Reporting Layer
+    - name: sales_reporting
+      tables:
+        - name: daily_sales_summary
+          target_table: ${GCP_PROJECT_ID}.sales_reporting.daily_sales_summary
+        - name: customer_metrics
+          target_table: ${GCP_PROJECT_ID}.sales_reporting.customer_metrics
+    
+    - name: inventory_reporting
+      tables:
+        - name: stock_status
+          target_table: ${GCP_PROJECT_ID}.inventory_reporting.stock_status
+
+# Spark Configuration
+spark:
+  app_name: BigQuery_ETL_Pipeline
+  configs:
+    spark.driver.memory: 4g
+    spark.executor.memory: 4g
+    spark.executor.cores: "2"
+    spark.dynamicAllocation.enabled: "true"
+    spark.shuffle.service.enabled: "true"
+    spark.ui.showConsoleProgress: "false"
+    spark.ui.enabled: "false"
+    spark.sql.execution.arrow.pyspark.enabled: "true"
+
+# Logging Configuration
+logging:
+  path: logs
+  retention_days: 30
+  level: INFO
