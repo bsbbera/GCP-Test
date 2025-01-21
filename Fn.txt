@@ -1,0 +1,92 @@
+from pyspark.sql import DataFrame
+from pyspark.sql.types import *
+from typing import Dict, Union, List
+from pyspark.sql.functions import col, cast
+
+def modify_schema(
+    df: DataFrame,
+    column_modifications: Dict[str, Union[str, Dict[str, str]]],
+    add_columns: Dict[str, str] = None,
+    drop_columns: List[str] = None
+) -> DataFrame:
+    """
+    Modify DataFrame schema including type changes, column additions, and drops.
+    
+    Args:
+        df (DataFrame): Input PySpark DataFrame
+        column_modifications (Dict): Dictionary of column name to new type or config
+            Example: {
+                'simple_col': 'integer',  # Simple type change
+                'complex_col': {          # Complex modification
+                    'type': 'decimal(10,2)',
+                    'nullable': False
+                }
+            }
+        add_columns (Dict): Dictionary of new column name to type
+            Example: {'new_col': 'string'}
+        drop_columns (List): List of column names to drop
+    
+    Returns:
+        DataFrame: Modified DataFrame
+    """
+    # Type mapping from string representations to PySpark types
+    type_mapping = {
+        'string': StringType(),
+        'integer': IntegerType(),
+        'long': LongType(),
+        'double': DoubleType(),
+        'boolean': BooleanType(),
+        'date': DateType(),
+        'timestamp': TimestampType()
+    }
+    
+    modified_df = df
+    
+    # Handle column modifications
+    for col_name, modification in column_modifications.items():
+        if col_name not in df.columns:
+            raise ValueError(f"Column {col_name} not found in DataFrame")
+            
+        if isinstance(modification, str):
+            # Simple type change
+            if modification.lower() in type_mapping:
+                modified_df = modified_df.withColumn(
+                    col_name,
+                    col(col_name).cast(type_mapping[modification.lower()])
+                )
+            else:
+                # Handle custom types like decimal(10,2)
+                modified_df = modified_df.withColumn(
+                    col_name,
+                    col(col_name).cast(modification)
+                )
+        else:
+            # Complex modification
+            new_type = modification['type']
+            if new_type.lower() in type_mapping:
+                new_type = type_mapping[new_type.lower()]
+            
+            modified_df = modified_df.withColumn(
+                col_name,
+                col(col_name).cast(new_type)
+            )
+    
+    # Add new columns
+    if add_columns:
+        for col_name, col_type in add_columns.items():
+            if col_type.lower() in type_mapping:
+                modified_df = modified_df.withColumn(
+                    col_name,
+                    lit(None).cast(type_mapping[col_type.lower()])
+                )
+            else:
+                modified_df = modified_df.withColumn(
+                    col_name,
+                    lit(None).cast(col_type)
+                )
+    
+    # Drop columns
+    if drop_columns:
+        modified_df = modified_df.drop(*drop_columns)
+    
+    return modified_df
