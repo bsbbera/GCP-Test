@@ -1,0 +1,49 @@
+import os
+import logging
+from logging.handlers import TimedRotatingFileHandler
+from config import LOG_PATH, LOG_FILE
+
+def setup_logger():
+    """Configure logger with custom format and rotation using standard logging library"""
+    
+    # Create logs directory if it doesn't exist
+    if not os.path.exists(LOG_PATH):
+        os.makedirs(LOG_PATH)
+    
+    # Create logger
+    logger = logging.getLogger('ETLLogger')
+    logger.setLevel(logging.INFO)
+    
+    # Prevent the log messages from being propagated to the root logger
+    logger.propagate = False
+    
+    # Remove any existing handlers
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s | %(levelname)s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # Create rotating file handler
+    file_handler = TimedRotatingFileHandler(
+        os.path.join(LOG_PATH, LOG_FILE),
+        when='midnight',
+        interval=1,
+        backupCount=30,  # Keep logs for 30 days
+        encoding='utf-8'
+    )
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.INFO)
+    
+    # Add handler to logger
+    logger.addHandler(file_handler)
+    
+    return logger
+
+# Usage example:
+# logger = setup_logger()
+# logger.info("Starting ETL process")
+# logger.error("Error occurred", exc_info=True)  # This will include stack trace
