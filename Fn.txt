@@ -41,6 +41,16 @@ def modify_schema(
     }
     
     modified_df = df
+
+    if rename_columns:
+        for old_name, new_name in rename_columns.items():
+            if old_name not in modified_df.columns:
+                raise ValueError(f"Column {old_name} not found in DataFrame")
+            modified_df = modified_df.withColumnRenamed(old_name, new_name)
+            
+            # Update column_modifications if the renamed column is also being modified
+            if old_name in column_modifications:
+                column_modifications[new_name] = column_modifications.pop(old_name)
     
     # Handle column modifications
     for col_name, modification in column_modifications.items():
