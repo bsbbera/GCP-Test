@@ -3,6 +3,22 @@ from pyspark.sql.types import *
 from typing import Dict, Union, List
 from pyspark.sql.functions import col, cast
 
+from pyspark.sql import SparkSession
+
+# Initialize Spark session with optimized configuration
+spark = SparkSession.builder \
+    .appName("BigQuery Processing") \
+    .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.28.0") \
+    .config("spark.executor.instances", "2") \  # 2 workers
+    .config("spark.executor.cores", "8") \      # 8 cores per worker
+    .config("spark.executor.memory", "25g") \   # 25GB memory per executor (leave some for overhead)
+    .config("spark.driver.memory", "4g") \      # 4GB memory for driver
+    .config("spark.sql.shuffle.partitions", "64") \  # Shuffle partitions for wide transformations
+    .getOrCreate()
+
+
+
+
 def modify_schema(
     df: DataFrame,
     column_modifications: Dict[str, Union[str, Dict[str, str]]],
