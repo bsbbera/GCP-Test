@@ -4,7 +4,12 @@ from logging.handlers import TimedRotatingFileHandler
 from config import LOG_PATH, LOG_FILE
 
 def setup_logger():
-    """Configure logger with custom format and rotation using standard logging library"""
+    """Configure logger with custom format and rotation while suppressing other loggers"""
+    
+    # Suppress all other loggers
+    logging.getLogger().handlers = []  # Remove root logger handlers
+    logging.getLogger('py4j').setLevel(logging.ERROR)  # Suppress py4j logs
+    logging.getLogger('pyspark').setLevel(logging.ERROR)  # Suppress pyspark logs
     
     # Create logs directory if it doesn't exist
     if not os.path.exists(LOG_PATH):
@@ -21,9 +26,9 @@ def setup_logger():
     if logger.hasHandlers():
         logger.handlers.clear()
     
-    # Create formatter
+    # Create formatter with more context
     formatter = logging.Formatter(
-        '%(asctime)s | %(levelname)s | %(message)s',
+        '%(asctime)s | %(levelname)s | %(name)s | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
@@ -38,8 +43,14 @@ def setup_logger():
     file_handler.setFormatter(formatter)
     file_handler.setLevel(logging.INFO)
     
-    # Add handler to logger
+    # Create console handler with same formatting
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(logging.INFO)
+    
+    # Add handlers to logger
     logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
     
     return logger
 
