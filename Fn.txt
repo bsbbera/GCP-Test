@@ -1,32 +1,62 @@
 from pyspark.sql import DataFrame
 from pyspark.sql.types import *
 from typing import Dict, Union, List
-from pyspark.sql.functions import col, cast
+from pyspark.sql.functions import col, cast, lit
 
 from pyspark.sql import SparkSession
 
 # Initialize Spark session with optimized configuration
 spark = SparkSession.builder \
     .appName("BigQuery Processing") \
-    .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.28.0") \
-    .config("spark.executor.instances", "2") \  # 2 workers
-    .config("spark.executor.cores", "8") \      # 8 cores per worker
-    .config("spark.executor.memory", "25g") \   # 25GB memory per executor (leave some for overhead)
-    .config("spark.driver.memory", "4g") \      # 4GB memory for driver
-    .config("spark.sql.shuffle.partitions", "64") \  # Shuffle partitions for wide transformations
+    .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.28.0")\
+    .config("spark.executor.instances", "2")\
+    .config("spark.executor.cores", "8")\
+    .config("spark.executor.memory", "25g")\
+    .config("spark.driver.memory", "4g")\
+    .config("spark.sql.shuffle.partitions", "64")\
     .getOrCreate()
 
-
-
+def rename_columns(df: DataFrame, rename_dict: Dict[str, str]) -> DataFrame:
+    """
+    Rename multiple columns in a DataFrame using a dictionary mapping.
+    
+    Args:
+        df (DataFrame): Input PySpark DataFrame
+        rename_dict (Dict[str, str]): Dictionary mapping old column names to new names
+            Example: {
+                'old_name1': 'new_name1',
+                'old_name2': 'new_name2'
+            }
+    
+    Returns:
+        DataFrame: DataFrame with renamed columns
+    
+    Raises:
+        ValueError: If any old column name doesn't exist in the DataFrame
+    """
+    modified_df = df
+    missing_columns = [col for col in rename_dict.keys() if col not in df.columns]
+    
+    if missing_columns:
+        raise ValueError(
+            f"Following columns not found in DataFrame: {', '.join(missing_columns)}"
+        )
+    
+    # Perform all renames in a single pass
+    for old_name, new_name in rename_dict.items():
+        modified_df = modified_df.withColumnRenamed(old_name, new_name)
+    
+    return modified_df
 
 def modify_schema(
     df: DataFrame,
     column_modifications: Dict[str, Union[str, Dict[str, str]]],
     add_columns: Dict[str, str] = None,
-    drop_columns: List[str] = None
+    drop_columns: List[str] = None,
+    rename_columns_dict: Dict[str, str] = None
 ) -> DataFrame:
     """
-    Modify DataFrame schema including type changes, column additions, and drops.
+    Modify DataFrame schema including type changes, column additions, drops, and renames.
     
     Args:
         df (DataFrame): Input PySpark DataFrame
@@ -41,6 +71,8 @@ def modify_schema(
         add_columns (Dict): Dictionary of new column name to type
             Example: {'new_col': 'string'}
         drop_columns (List): List of column names to drop
+        rename_columns_dict (Dict): Dictionary mapping old column names to new names
+            Example: {'old_name': 'new_name'}
     
     Returns:
         DataFrame: Modified DataFrame
@@ -58,19 +90,21 @@ def modify_schema(
     
     modified_df = df
 
-    if rename_columns:
-        for old_name, new_name in rename_columns.items():
-            if old_name not in modified_df.columns:
-                raise ValueError(f"Column {old_name} not found in DataFrame")
-            modified_df = modified_df.withColumnRenamed(old_name, new_name)
-            
-            # Update column_modifications if the renamed column is also being modified
-            if old_name in column_modifications:
-                column_modifications[new_name] = column_modifications.pop(old_name)
+    # Handle column renames first
+    if rename_columns_dict:
+        modified_df = rename_columns(modified_df, rename_columns_dict)
+        # Update column_modifications if any renamed columns are being modified
+        updated_modifications = {}
+        for col_name, modification in column_modifications.items():
+            if col_name in rename_columns_dict:
+                updated_modifications[rename_columns_dict[col_name]] = modification
+            else:
+                updated_modifications[col_name] = modification
+        column_modifications = updated_modifications
     
     # Handle column modifications
     for col_name, modification in column_modifications.items():
-        if col_name not in df.columns:
+        if col_name not in modified_df.columns:
             raise ValueError(f"Column {col_name} not found in DataFrame")
             
         if isinstance(modification, str):
