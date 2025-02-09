@@ -2,6 +2,40 @@ import os
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from config import LOG_PATH, LOG_FILE
+from colorama import init, Fore, Style
+
+# Initialize colorama for Windows support
+init()
+
+class ColoredFormatter(logging.Formatter):
+    """Custom formatter with colors for different log levels"""
+    
+    COLORS = {
+        'DEBUG': Fore.WHITE,
+        'INFO': Fore.BLUE,
+        'SUCCESS': Fore.GREEN,
+        'WARNING': Fore.YELLOW,
+        'ERROR': Fore.RED,
+        'CRITICAL': Fore.RED + Style.BRIGHT
+    }
+
+    def format(self, record):
+        # Add SUCCESS level color if message starts with "Success" or "Successfully"
+        if record.levelno == logging.INFO and (
+            record.msg.startswith('Success') or 
+            record.msg.startswith('Successfully')
+        ):
+            color = self.COLORS['SUCCESS']
+        else:
+            color = self.COLORS.get(record.levelname, Fore.WHITE)
+        
+        # Color the entire message including timestamp
+        record.msg = f"{color}{record.msg}{Style.RESET_ALL}"
+        
+        # Add color to level name
+        record.levelname = f"{color}{record.levelname}{Style.RESET_ALL}"
+        
+        return super().format(record)
 
 def setup_logger():
     """Configure logger with custom format and rotation while suppressing other loggers"""
@@ -26,13 +60,18 @@ def setup_logger():
     if logger.hasHandlers():
         logger.handlers.clear()
     
-    # Create formatter with more context
-    formatter = logging.Formatter(
-        '%(asctime)s | %(levelname)s | %(name)s | %(message)s',
+    # Create formatters
+    file_formatter = logging.Formatter(
+        '%(asctime)s | %(levelname)s | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
-    # Create rotating file handler
+    console_formatter = ColoredFormatter(
+        '%(asctime)s | %(levelname)s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # Create rotating file handler (without colors)
     file_handler = TimedRotatingFileHandler(
         os.path.join(LOG_PATH, LOG_FILE),
         when='midnight',
@@ -40,12 +79,12 @@ def setup_logger():
         backupCount=30,  # Keep logs for 30 days
         encoding='utf-8'
     )
-    file_handler.setFormatter(formatter)
+    file_handler.setFormatter(file_formatter)
     file_handler.setLevel(logging.INFO)
     
-    # Create console handler with same formatting
+    # Create console handler (with colors)
     console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
+    console_handler.setFormatter(console_formatter)
     console_handler.setLevel(logging.INFO)
     
     # Add handlers to logger
@@ -56,5 +95,7 @@ def setup_logger():
 
 # Usage example:
 # logger = setup_logger()
-# logger.info("Starting ETL process")
-# logger.error("Error occurred", exc_info=True)  # This will include stack trace
+# logger.info("Basic info message")  # Blue
+# logger.info("Successfully completed task")  # Green
+# logger.warning("Warning message")  # Yellow/Orange
+# logger.error("Error message")  # Red
