@@ -47,7 +47,8 @@ def create_grouped_columns_with_filter_and_impute(df, pivot_col, agg_cols, group
                 for filter_value in filter_values:
                     agg_expr = sum(
                         when((col(pivot_col) == value) & (col(filter_col) == filter_value, col(agg_col))
-                    agg_exprs.append(agg_expr.alias(f"{value}_{filter_value}_{agg_col}"))
+                    ).alias(f"{value}_{filter_value}_{agg_col}")
+                    agg_exprs.append(agg_expr)
             else:
                 # If no filter column, create regular aggregations
                 agg_expr = sum(when(col(pivot_col) == value, col(agg_col))).alias(f"{value}_{agg_col}")
