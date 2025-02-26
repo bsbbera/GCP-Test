@@ -4,20 +4,20 @@ from pyspark.sql.functions import sum, when, col
 # Initialize Spark session
 spark = SparkSession.builder.appName("DynamicPivotWithFilterAndImpute").getOrCreate()
 
-# Sample data (replace this with reading from the actual Excel file)
+# Sample data
 data = [
     ("N1", 3765476.02, 12, "Overseas", "FCY", "BT"),
     ("N2", 5767476.02, 34, "Domestic", "FCY", "BT"),
     ("N1", 7769476.02, 23, "Overseas", "LCY", "FIP"),
     ("N4", 9771476.02, 56, "Overseas", "OTHERS", "CIP"),
-    ("N3", 11773476.02, 76, "Domestic", "LCY", "FIP")
+    ("N3", 11773476.02, 76, "Domestic", "LCY", "FIP"),
 ]
 
 # Create DataFrame
 columns = ["N_KEY", "TRAN_AMT", "TRAN_CNT", "Region", "CUUR", "TRAN_TYPE"]
 df = spark.createDataFrame(data, columns)
 
-# Function to dynamically create grouped columns with filter criteria and impute nulls as 0.0
+# Function to dynamically create grouped columns
 def create_grouped_columns_with_filter_and_impute(df, pivot_col, agg_cols, group_by_col, filter_col=None):
     """
     Dynamically creates grouped columns based on a pivot column, aggregation columns, and optional filter criteria.
@@ -46,7 +46,7 @@ def create_grouped_columns_with_filter_and_impute(df, pivot_col, agg_cols, group
                 # If filter column is provided, create filtered aggregations
                 for filter_value in filter_values:
                     agg_expr = sum(
-                        when((col(pivot_col) == value) & (col(filter_col) == filter_value, col(agg_col))
+                        when((col(pivot_col) == value) & (col(filter_col) == filter_value), col(agg_col))
                     ).alias(f"{value}_{filter_value}_{agg_col}")
                     agg_exprs.append(agg_expr)
             else:
@@ -60,9 +60,9 @@ def create_grouped_columns_with_filter_and_impute(df, pivot_col, agg_cols, group
     # Impute null values as 0.0
     grouped_df = grouped_df.fillna(0.0)
 
-    return grouped_df
+    return grouped_df  # **Missing return statement added**
 
-# Example usage of the function
+# Example usage
 pivot_col = "TRAN_TYPE"  # Column to pivot
 agg_cols = ["TRAN_AMT", "TRAN_CNT"]  # Columns to aggregate
 group_by_col = "N_KEY"  # Column to group by
