@@ -1,0 +1,74 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import sum, when, col
+
+# Initialize Spark session
+spark = SparkSession.builder.appName("DynamicPivotWithFilterAndImpute").getOrCreate()
+
+# Sample data (replace this with reading from the actual Excel file)
+data = [
+    ("N1", 3765476.02, 12, "Overseas", "FCY", "BT"),
+    ("N2", 5767476.02, 34, "Domestic", "FCY", "BT"),
+    ("N1", 7769476.02, 23, "Overseas", "LCY", "FIP"),
+    ("N4", 9771476.02, 56, "Overseas", "OTHERS", "CIP"),
+    ("N3", 11773476.02, 76, "Domestic", "LCY", "FIP")
+]
+
+# Create DataFrame
+columns = ["N_KEY", "TRAN_AMT", "TRAN_CNT", "Region", "CUUR", "TRAN_TYPE"]
+df = spark.createDataFrame(data, columns)
+
+# Function to dynamically create grouped columns with filter criteria and impute nulls as 0.0
+def create_grouped_columns_with_filter_and_impute(df, pivot_col, agg_cols, group_by_col, filter_col=None):
+    """
+    Dynamically creates grouped columns based on a pivot column, aggregation columns, and optional filter criteria.
+    Imputes null values as 0.0 in the final DataFrame.
+
+    :param df: Input DataFrame
+    :param pivot_col: Column to pivot (e.g., "TRAN_TYPE")
+    :param agg_cols: List of columns to aggregate (e.g., ["TRAN_AMT", "TRAN_CNT"])
+    :param group_by_col: Column to group by (e.g., "N_KEY")
+    :param filter_col: Optional column to filter by (e.g., "Region")
+    :return: DataFrame with grouped columns and nulls imputed as 0.0
+    """
+    # Get unique values from the pivot column
+    pivot_values = df.select(pivot_col).distinct().rdd.flatMap(lambda x: x).collect()
+
+    # Get unique values from the filter column (if provided)
+    filter_values = []
+    if filter_col:
+        filter_values = df.select(filter_col).distinct().rdd.flatMap(lambda x: x).collect()
+
+    # Dynamically generate aggregation expressions
+    agg_exprs = []
+    for value in pivot_values:
+        for agg_col in agg_cols:
+            if filter_col:
+                # If filter column is provided, create filtered aggregations
+                for filter_value in filter_values:
+                    agg_expr = sum(
+                        when((col(pivot_col) == value) & (col(filter_col) == filter_value, col(agg_col))
+                    agg_exprs.append(agg_expr.alias(f"{value}_{filter_value}_{agg_col}"))
+            else:
+                # If no filter column, create regular aggregations
+                agg_expr = sum(when(col(pivot_col) == value, col(agg_col))).alias(f"{value}_{agg_col}")
+                agg_exprs.append(agg_expr)
+
+    # Perform aggregation
+    grouped_df = df.groupBy(group_by_col).agg(*agg_exprs)
+
+    # Impute null values as 0.0
+    grouped_df = grouped_df.fillna(0.0)
+
+    return grouped_df
+
+# Example usage of the function
+pivot_col = "TRAN_TYPE"  # Column to pivot
+agg_cols = ["TRAN_AMT", "TRAN_CNT"]  # Columns to aggregate
+group_by_col = "N_KEY"  # Column to group by
+filter_col = "Region"  # Optional column to filter by
+
+# Call the function
+result_df = create_grouped_columns_with_filter_and_impute(df, pivot_col, agg_cols, group_by_col, filter_col)
+
+# Show the result
+result_df.show()
