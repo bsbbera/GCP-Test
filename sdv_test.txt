@@ -1,104 +1,228 @@
 from google.cloud import bigquery
 import pandas as pd
-from sdv.tabular import GaussianCopula
+import numpy as np
 import os
+from sdv.metadata import SingleTableMetadata
+from sdv.single_table import GaussianCopulaSynthesizer
 
-# Setup Google Cloud credentials
-# Either set this in your environment or specify the path to your service account key file
-# os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "path/to/your/service-account-key.json"
-
-def get_bigquery_metadata_for_sdv(project_id, dataset_id, table_id):
+def get_bigquery_data_and_metadata(project_id, dataset_id, table_id, sample_size=None):
     """
-    Extract metadata from a BigQuery table and format it for SDV.
-    
-    Args:
-        project_id (str): Google Cloud project ID
-        dataset_id (str): BigQuery dataset ID
-        table_id (str): BigQuery table ID
-        
-    Returns:
-        tuple: (reference_data, sdv_metadata)
+    Extract data and metadata from a BigQuery table and format it for SDV.
     """
     # Initialize BigQuery client
     client = bigquery.Client(project=project_id)
     
-    # Get table reference
-    table_ref = client.dataset(dataset_id).table(table_id)
+    # Construct query
+    if sample_size:
+        query = f"SELECT * FROM `{project_id}.{dataset_id}.{table_id}` LIMIT {sample_size}"
+    else:
+        query = f"SELECT * FROM `{project_id}.{dataset_id}.{table_id}`"
     
-    # Get table object
-    table = client.get_table(table_ref)
-    
-    # Extract schema information
-    schema = table.schema
-    
-    # Build metadata dictionary for SDV
-    sdv_metadata = {
-        'fields': {}
-    }
-    
-    # Load data sample to help determine data types
-    query = f"SELECT * FROM `{project_id}.{dataset_id}.{table_id}` LIMIT 1000"
-    df_sample = client.query(query).to_dataframe()
-    
-    # Process each field in the schema
-    for field in schema:
-        field_name = field.name
-        field_type = field.field_type
-        
-        # Map BigQuery types to SDV types
-        if field_type == 'STRING':
-            # Check if it's categorical by examining unique values
-            unique_count = df_sample[field_name].nunique()
-            total_count = len(df_sample[field_name])
-            
-            # If field has low cardinality relative to row count, treat as categorical
-            if unique_count < min(20, total_count * 0.1):  # Adjust these thresholds as needed
-                categories = df_sample[field_name].dropna().unique().tolist()
-                sdv_metadata['fields'][field_name] = {
-                    'type': 'categorical',
-                    'categories': categories
-                }
-            else:
-                sdv_metadata['fields'][field_name] = {
-                    'type': 'text'
-                }
-                
-        elif field_type == 'BOOL':
-            sdv_metadata['fields'][field_name] = {
-                'type': 'boolean'
-            }
-            
-        elif field_type in ['INT64', 'NUMERIC', 'FLOAT64']:
-            # Check if it looks like a boolean (just 0s and 1s)
-            if set(df_sample[field_name].dropna().unique()) <= {0, 1}:
-                sdv_metadata['fields'][field_name] = {
-                    'type': 'boolean'
-                }
-            else:
-                sdv_metadata['fields'][field_name] = {
-                    'type': 'numerical',
-                    'subtype': 'integer' if field_type == 'INT64' else 'float'
-                }
-                
-        elif field_type == 'DATE':
-            sdv_metadata['fields'][field_name] = {
-                'type': 'datetime',
-                'format': '%Y-%m-%d'
-            }
-            
-        elif field_type == 'TIMESTAMP':
-            sdv_metadata['fields'][field_name] = {
-                'type': 'datetime',
-                'format': '%Y-%m-%d %H:%M:%S'
-            }
-    
-    # Load actual data for SDV
-    query = f"SELECT * FROM `{project_id}.{dataset_id}.{table_id}`"
     print(f"Fetching data from BigQuery table: {project_id}.{dataset_id}.{table_id}")
     reference_data = client.query(query).to_dataframe()
     print(f"Loaded {len(reference_data)} rows from BigQuery")
     
-    return reference_data, sdv_metadata
+    # Clean and preprocess data
+    reference_data = preprocess_data(reference_data)
+    
+    # Create SingleTableMetadata instance
+    metadata = SingleTableMetadata()
+    
+    # Automatically detect the data types
+    metadata.detect_from_dataframe(reference_data)
+    
+    # Print detected metadata
+    print("\nDetected metadata types:")
+    for column, dtype in metadata.columns.items():
+        print(f"{column}: {dtype}")
+    
+    return reference_data, metadata
+
+def preprocess_data(df):
+    """
+    Preprocess the data to handle common issues that cause errors in SDV.
+    """
+    df_cleaned = df.copy()
+    
+    # Handle each column type appropriately
+    for column in df_cleaned.columns:
+        # Skip if the column is completely empty
+        if df_cleaned[column].isna().all():
+            continue
+            
+        # Check if column contains numeric data
+        if pd.api.types.is_numeric_dtype(df_cleaned[column]):
+            # Replace infinite values with NaN
+            df_cleaned[column] = df_cleaned[column].replace([np.inf, -np.inf], np.nan)
+            
+            # Handle very large numbers
+            max_value = np.finfo(np.float64).max / 1e10  # Safe maximum value
+            min_value = np.finfo(np.float64).min / 1e10  # Safe minimum value
+            
+            # Replace extreme values with bounds
+            df_cleaned[column] = df_cleaned[column].clip(min_value, max_value)
+            
+            # If the column was originally integer, convert NaN to a suitable value
+            if pd.api.types.is_integer_dtype(df[column]):
+                # Use median to fill NaN values for integer columns
+                median_value = df_cleaned[column].median()
+                if pd.isna(median_value):  # If median is also NaN
+                    median_value = 0
+                df_cleaned[column] = df_cleaned[column].fillna(median_value).astype('int64')
+            
+        # Handle dates and timestamps
+        elif pd.api.types.is_datetime64_any_dtype(df_cleaned[column]):
+            # Convert to datetime format and handle NaT values
+            df_cleaned[column] = pd.to_datetime(df_cleaned[column], errors='coerce')
+            
+            # For datetime columns, use the median date to fill NaT values
+            if df_cleaned[column].isna().any():
+                median_date = df_cleaned[column].dropna().median()
+                if pd.isna(median_date):  # If median is NaT
+                    # Use a default date (e.g., 2000-01-01)
+                    df_cleaned[column] = df_cleaned[column].fillna(pd.Timestamp('2000-01-01'))
+                else:
+                    df_cleaned[column] = df_cleaned[column].fillna(median_date)
+        
+        # Handle categorical/string columns
+        elif pd.api.types.is_string_dtype(df_cleaned[column]) or pd.api.types.is_categorical_dtype(df_cleaned[column]):
+            # Fill NaN values with a placeholder
+            df_cleaned[column] = df_cleaned[column].fillna('Unknown')
+    
+    return df_cleaned
+
+def create_synthetic_data(reference_data, metadata, num_rows=None):
+    """
+    Create synthetic data based on reference data and metadata.
+    """
+    try:
+        # Create synthesizer with appropriate parameters
+        synthesizer = GaussianCopulaSynthesizer(
+            metadata,
+            # Adding more parameters to handle errors
+            enforce_min_max_values=True,
+            enforce_rounding=True,
+            numerical_distributions={
+                'bounded': 'beta',
+                'unbounded': 'truncated_normal'
+            }
+        )
+        
+        # Fit the synthesizer
+        print("Fitting synthesizer on reference data...")
+        synthesizer.fit(reference_data)
+        
+        # Generate synthetic data
+        if num_rows is None:
+            num_rows = len(reference_data)
+            
+        print(f"Generating {num_rows} rows of synthetic data...")
+        synthetic_data = synthesizer.sample(num_rows=num_rows)
+        
+        return synthetic_data, synthesizer
+    
+    except Exception as e:
+        print(f"Error during synthetic data generation: {str(e)}")
+        
+        # Try to diagnose the issue
+        print("\nAttempting to diagnose the issue:")
+        
+        # Check for infinity or NaN values
+        for column in reference_data.columns:
+            if pd.api.types.is_numeric_dtype(reference_data[column]):
+                inf_count = np.isinf(reference_data[column].dropna()).sum()
+                nan_count = reference_data[column].isna().sum()
+                if inf_count > 0:
+                    print(f"Column '{column}' contains {inf_count} infinite values")
+                if nan_count > 0:
+                    print(f"Column '{column}' contains {nan_count} NaN values")
+        
+        # Check for extreme values
+        for column in reference_data.columns:
+            if pd.api.types.is_numeric_dtype(reference_data[column]):
+                try:
+                    max_val = reference_data[column].max()
+                    min_val = reference_data[column].min()
+                    if max_val > 1e10 or min_val < -1e10:
+                        print(f"Column '{column}' has extreme values: min={min_val}, max={max_val}")
+                except:
+                    print(f"Column '{column}' has values that can't be compared")
+        
+        # Provide fallback approach
+        print("\nTrying alternative approach with more aggressive preprocessing...")
+        
+        # More aggressive preprocessing
+        clean_data = reference_data.copy()
+        for column in clean_data.columns:
+            if pd.api.types.is_numeric_dtype(clean_data[column]):
+                # Replace problematic values with median
+                median = clean_data[column].median()
+                if pd.isna(median):
+                    median = 0
+                clean_data[column] = clean_data[column].replace([np.inf, -np.inf], median)
+                clean_data[column] = clean_data[column].fillna(median)
+                
+                # Ensure values are within safe range
+                clean_data[column] = clean_data[column].clip(-1e8, 1e8)
+        
+        # Try with a different synthesizer
+        try:
+            from sdv.single_table import CTGANSynthesizer
+            print("Trying CTGANSynthesizer instead...")
+            ctgan = CTGANSynthesizer(metadata)
+            ctgan.fit(clean_data)
+            synthetic_data = ctgan.sample(num_rows=len(clean_data) if num_rows is None else num_rows)
+            return synthetic_data, ctgan
+        except Exception as e2:
+            print(f"Alternative approach also failed: {str(e2)}")
+            
+            # Last resort: return a simplified version of the data
+            print("\nCreating a simplified synthetic dataset as fallback...")
+            synthetic_data = simplify_and_generate(clean_data)
+            return synthetic_data, None
+
+def simplify_and_generate(df):
+    """
+    Create a simplified synthetic dataset when other methods fail.
+    """
+    synthetic = pd.DataFrame()
+    
+    for column in df.columns:
+        if pd.api.types.is_numeric_dtype(df[column]):
+            # Generate random numbers within the range of the original column
+            min_val = max(df[column].min(), -1e8)
+            max_val = min(df[column].max(), 1e8)
+            synthetic[column] = np.random.uniform(min_val, max_val, len(df))
+            
+            # Preserve integer type if original was integer
+            if pd.api.types.is_integer_dtype(df[column]):
+                synthetic[column] = synthetic[column].round().astype('int64')
+                
+        elif pd.api.types.is_datetime64_any_dtype(df[column]):
+            # Generate random dates within the range of the original column
+            min_date = df[column].min()
+            max_date = df[column].max()
+            if pd.isna(min_date) or pd.isna(max_date):
+                # Fallback to a reasonable date range
+                min_date = pd.Timestamp('2000-01-01')
+                max_date = pd.Timestamp('2023-01-01')
+                
+            # Generate random timestamps
+            days_range = (max_date - min_date).days
+            if days_range <= 0:
+                days_range = 365  # Fallback to 1 year range
+                
+            random_days = np.random.randint(0, days_range, len(df))
+            synthetic[column] = min_date + pd.to_timedelta(random_days, unit='D')
+            
+        else:
+            # For categorical/string columns, sample from the original values
+            values = df[column].dropna().unique()
+            if len(values) == 0:
+                values = ['Unknown']
+            synthetic[column] = np.random.choice(values, len(df))
+    
+    return synthetic
 
 # Example usage
 def main():
@@ -108,31 +232,30 @@ def main():
     TABLE_ID = "your_table"
     
     # Get data and metadata from BigQuery
-    real_data, metadata = get_bigquery_metadata_for_sdv(PROJECT_ID, DATASET_ID, TABLE_ID)
+    real_data, metadata = get_bigquery_data_and_metadata(
+        PROJECT_ID, DATASET_ID, TABLE_ID, sample_size=10000
+    )
     
     print("\nReference data sample:")
     print(real_data.head())
     
-    print("\nExtracted metadata for SDV:")
-    print(metadata)
-    
-    # Create and fit the SDV model
-    model = GaussianCopula(metadata=metadata)
-    model.fit(real_data)
-    
-    # Generate synthetic data
-    num_samples = len(real_data)  # Generate same number of samples as original
-    synthetic_data = model.sample(num_samples)
+    # Create synthetic data
+    synthetic_data, synthesizer = create_synthetic_data(real_data, metadata)
     
     print("\nSynthetic data sample:")
     print(synthetic_data.head())
     
     # Save the results
     synthetic_data.to_csv('synthetic_data_from_bigquery.csv', index=False)
-    model.save('sdv_model_from_bigquery.pkl')
+    if synthesizer:
+        synthesizer.save('sdv_model_from_bigquery.pkl')
+        print("Model saved to 'sdv_model_from_bigquery.pkl'")
+    
+    # Save metadata separately
+    metadata.save_to_json('metadata_from_bigquery.json')
     
     print("\nSynthetic data saved to 'synthetic_data_from_bigquery.csv'")
-    print("Model saved to 'sdv_model_from_bigquery.pkl'")
+    print("Metadata saved to 'metadata_from_bigquery.json'")
 
 if __name__ == "__main__":
     main()
