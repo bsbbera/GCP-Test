@@ -1,0 +1,138 @@
+from google.cloud import bigquery
+import pandas as pd
+from sdv.tabular import GaussianCopula
+import os
+
+# Setup Google Cloud credentials
+# Either set this in your environment or specify the path to your service account key file
+# os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "path/to/your/service-account-key.json"
+
+def get_bigquery_metadata_for_sdv(project_id, dataset_id, table_id):
+    """
+    Extract metadata from a BigQuery table and format it for SDV.
+    
+    Args:
+        project_id (str): Google Cloud project ID
+        dataset_id (str): BigQuery dataset ID
+        table_id (str): BigQuery table ID
+        
+    Returns:
+        tuple: (reference_data, sdv_metadata)
+    """
+    # Initialize BigQuery client
+    client = bigquery.Client(project=project_id)
+    
+    # Get table reference
+    table_ref = client.dataset(dataset_id).table(table_id)
+    
+    # Get table object
+    table = client.get_table(table_ref)
+    
+    # Extract schema information
+    schema = table.schema
+    
+    # Build metadata dictionary for SDV
+    sdv_metadata = {
+        'fields': {}
+    }
+    
+    # Load data sample to help determine data types
+    query = f"SELECT * FROM `{project_id}.{dataset_id}.{table_id}` LIMIT 1000"
+    df_sample = client.query(query).to_dataframe()
+    
+    # Process each field in the schema
+    for field in schema:
+        field_name = field.name
+        field_type = field.field_type
+        
+        # Map BigQuery types to SDV types
+        if field_type == 'STRING':
+            # Check if it's categorical by examining unique values
+            unique_count = df_sample[field_name].nunique()
+            total_count = len(df_sample[field_name])
+            
+            # If field has low cardinality relative to row count, treat as categorical
+            if unique_count < min(20, total_count * 0.1):  # Adjust these thresholds as needed
+                categories = df_sample[field_name].dropna().unique().tolist()
+                sdv_metadata['fields'][field_name] = {
+                    'type': 'categorical',
+                    'categories': categories
+                }
+            else:
+                sdv_metadata['fields'][field_name] = {
+                    'type': 'text'
+                }
+                
+        elif field_type == 'BOOL':
+            sdv_metadata['fields'][field_name] = {
+                'type': 'boolean'
+            }
+            
+        elif field_type in ['INT64', 'NUMERIC', 'FLOAT64']:
+            # Check if it looks like a boolean (just 0s and 1s)
+            if set(df_sample[field_name].dropna().unique()) <= {0, 1}:
+                sdv_metadata['fields'][field_name] = {
+                    'type': 'boolean'
+                }
+            else:
+                sdv_metadata['fields'][field_name] = {
+                    'type': 'numerical',
+                    'subtype': 'integer' if field_type == 'INT64' else 'float'
+                }
+                
+        elif field_type == 'DATE':
+            sdv_metadata['fields'][field_name] = {
+                'type': 'datetime',
+                'format': '%Y-%m-%d'
+            }
+            
+        elif field_type == 'TIMESTAMP':
+            sdv_metadata['fields'][field_name] = {
+                'type': 'datetime',
+                'format': '%Y-%m-%d %H:%M:%S'
+            }
+    
+    # Load actual data for SDV
+    query = f"SELECT * FROM `{project_id}.{dataset_id}.{table_id}`"
+    print(f"Fetching data from BigQuery table: {project_id}.{dataset_id}.{table_id}")
+    reference_data = client.query(query).to_dataframe()
+    print(f"Loaded {len(reference_data)} rows from BigQuery")
+    
+    return reference_data, sdv_metadata
+
+# Example usage
+def main():
+    # Replace with your actual Google Cloud project, dataset, and table IDs
+    PROJECT_ID = "your-project-id"
+    DATASET_ID = "your_dataset"
+    TABLE_ID = "your_table"
+    
+    # Get data and metadata from BigQuery
+    real_data, metadata = get_bigquery_metadata_for_sdv(PROJECT_ID, DATASET_ID, TABLE_ID)
+    
+    print("\nReference data sample:")
+    print(real_data.head())
+    
+    print("\nExtracted metadata for SDV:")
+    print(metadata)
+    
+    # Create and fit the SDV model
+    model = GaussianCopula(metadata=metadata)
+    model.fit(real_data)
+    
+    # Generate synthetic data
+    num_samples = len(real_data)  # Generate same number of samples as original
+    synthetic_data = model.sample(num_samples)
+    
+    print("\nSynthetic data sample:")
+    print(synthetic_data.head())
+    
+    # Save the results
+    synthetic_data.to_csv('synthetic_data_from_bigquery.csv', index=False)
+    model.save('sdv_model_from_bigquery.pkl')
+    
+    print("\nSynthetic data saved to 'synthetic_data_from_bigquery.csv'")
+    print("Model saved to 'sdv_model_from_bigquery.pkl'")
+
+if __name__ == "__main__":
+    main()
