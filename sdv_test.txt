@@ -36,3 +36,40 @@ df = df.withColumn(
         1
     ).otherwise(0)
 )
+
+
+from pyspark.sql import functions as F
+
+df = df.withColumn(
+    "FLAG",
+    F.when(
+        (F.col("D_LST_PUR_DTE") == "01JAN1960") & (F.col("N_AGE_ACC") < 3),
+        "0.NUMP"
+    ).when(
+        F.col("LAST_PUR_DAY_DIFF") == 0,
+        "1. SPEND ACTIVE"
+    ).when(
+        F.col("LAST_PUR_DAY_DIFF").between(1, 3),
+        "2. 1-3 MONTHS SPEND INACTIVE"
+    ).when(
+        (F.col("LAST_PUR_DAY_DIFF").between(3, 6)) |
+        ((F.col("D_LST_PUR_DTE") == "01JAN1960") & (F.col("N_AGE_ACC").between(3, 6))),
+        "3. 3-6 MONTHS SPEND INACTIVE"
+    ).when(
+        (F.col("LAST_PUR_DAY_DIFF").between(6, 12)) |
+        ((F.col("D_LST_PUR_DTE") == "01JAN1960") & (F.col("N_AGE_ACC").between(6, 12))),
+        "4. 6-12 MONTHS SPEND INACTIVE"
+    ).when(
+        (F.col("LAST_PUR_DAY_DIFF").between(12, 24)) |
+        ((F.col("D_LST_PUR_DTE") == "01JAN1960") & (F.col("N_AGE_ACC").between(12, 24))),
+        "5. 12-24 MONTHS SPEND INACTIVE"
+    ).when(
+        (F.col("LAST_PUR_DAY_DIFF").between(24, 36)) |
+        ((F.col("D_LST_PUR_DTE") == "01JAN1960") & (F.col("N_AGE_ACC").between(24, 36))),
+        "6. 24-36 MONTHS SPEND INACTIVE"
+    ).when(
+        (F.col("LAST_PUR_DAY_DIFF") >= 36) |
+        ((F.col("D_LST_PUR_DTE") == "01JAN1960") & (F.col("N_AGE_ACC") >= 36)),
+        "7. 36+ MONTHS SPEND INACTIVE"
+    ).otherwise("")
+)
