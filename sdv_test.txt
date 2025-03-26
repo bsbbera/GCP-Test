@@ -11,3 +11,28 @@ spark = SparkSession.builder \
     .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \  # Adjust partitions dynamically
     .config("spark.sql.adaptive.coalescePartitions.minPartitionSize", "64MB") \  # Avoid too small partitions
     .getOrCreate()
+
+
+
+from pyspark.sql import functions as F
+
+# Assuming df is your DataFrame and Start_date/End_date are defined variables
+df = df.withColumn(
+    "N_LMT_INC",
+    F.when(
+        (F.col("D_CR_LMT_ASGN_DTE").between(Start_date, End_date)) &
+        (F.col("A_LST_CR_LMT") < F.col("A_CR_LMT")) &
+        (F.col("D_CR_LMT_ASGN_DTE") > F.col("D_AC_OPEN_DTE")) &
+        (F.col("A_LST_CR_LMT") > 0) &
+        (F.col("CLI_MOB") > 2),
+        1
+    ).when(
+        (F.col("D_CR_LMT_ASGN_DTE").between(Start_date, End_date)) &
+        (F.col("A_LST_CR_LMT") < F.col("A_CR_LMT")) &
+        (F.col("D_CR_LMT_ASGN_DTE") > F.col("D_AC_OPEN_DTE")) &
+        (F.col("A_LST_CR_LMT") > 0) &
+        (F.col("CLI_MOB") <= 2) &
+        (F.col("A_LST_CR_LMT") != 3000),
+        1
+    ).otherwise(0)
+)
