@@ -1,0 +1,124 @@
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from datetime import datetime, timedelta
+import json
+
+# Constants (replace with your actual values)
+BQ_PROJECT = "your_project"
+BQ_DATASET = "your_dataset"
+RESULTS_TABLE = f"{BQ_PROJECT}.{BQ_DATASET}.dq_results"
+
+def initialize_spark():
+    return SparkSession.builder \
+        .appName("AutoDataQuality") \
+        .config("spark.jars.packages", "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.28.0") \
+        .getOrCreate()
+
+def get_date_parameters():
+    today = datetime.now().strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    start_date_30d = (datetime.now() - timedelta(days=31)).strftime("%Y-%m-%d")
+    return today, yesterday, start_date_30d
+
+def process_table(spark, table_config, date_params):
+    today, yesterday, start_date_30d = date_params
+    table_name = table_config["table_name"]
+    bq_table = f"{BQ_PROJECT}.{BQ_DATASET}.{table_name}"
+    
+    # Get the first date column as default for analysis
+    date_col = table_config["DATE_COLS"][0] if table_config["DATE_COLS"] else None
+    if not date_col:
+        print(f"Skipping {table_name} - no date column found")
+        return None
+    
+    # Read only necessary columns and date range
+    columns_to_read = table_config["NUMERICAL_COLS"] + [date_col]
+    df = spark.read.format("bigquery") \
+        .option("table", bq_table) \
+        .load() \
+        .select(columns_to_read) \
+        .filter(F.col(date_col).between(start_date_30d, today))
+    
+    # Create daily aggregates for all numerical columns
+    agg_exprs = [F.sum(col).alias(f"{col}_sum") for col in table_config["NUMERICAL_COLS"]]
+    df_daily = df.groupBy(date_col).agg(*agg_exprs)
+    
+    # Melt to long format (date, kpi_name, daily_value)
+    kpi_cols = [f"{col}_sum" for col in table_config["NUMERICAL_COLS"]]
+    stack_expr = f"stack({len(kpi_cols)}, {', '.join([f'\"{c}\", `{c}`' for c in kpi_cols])}) as (kpi_name, daily_value)"
+    df_long = df_daily.select(date_col, F.expr(stack_expr))
+    
+    # Window functions for calculations
+    kpi_window = Window.partitionBy("kpi_name").orderBy(F.col(date_col).desc())
+    rolling_window = Window.partitionBy("kpi_name") \
+        .orderBy(F.col(date_col).cast("long")) \
+        .rangeBetween(-30*86400, -86400)  # 30 days excluding today
+    
+    # Calculate all metrics
+    df_metrics = df_long \
+        .withColumn("prev_value", F.lag("daily_value").over(kpi_window)) \
+        .withColumn("pct_diff", (F.col("daily_value") - F.col("prev_value")) / F.col("prev_value") * 100) \
+        .withColumn("mean_30d", F.avg("daily_value").over(rolling_window)) \
+        .withColumn("stddev_30d", F.stddev("daily_value").over(rolling_window)) \
+        .withColumn("z_score", (F.col("daily_value") - F.col("mean_30d")) / F.col("stddev_30d")) \
+        .filter(F.col(date_col) == today) \
+        .withColumn("pct_diff_flag", F.when(
+            (F.abs(F.col("pct_diff")) > config["global_threshold_pct"]) & 
+            F.col("prev_value").isNotNull(), 1).otherwise(0)) \
+        .withColumn("sigma_flag", F.when(
+            F.abs(F.col("z_score")) > config["global_sigma_threshold"], 1).otherwise(0)) \
+        .withColumn("table_name", F.lit(table_name))
+    
+    return df_metrics.select(
+        "table_name",
+        "kpi_name",
+        F.col(date_col).alias("snapshot_date"),
+        "daily_value",
+        "prev_value",
+        "pct_diff",
+        "pct_diff_flag",
+        "mean_30d",
+        "stddev_30d",
+        "z_score",
+        "sigma_flag"
+    )
+
+def main():
+    spark = initialize_spark()
+    
+    # Load configuration
+    with open("dq_config.json") as f:
+        config = json.load(f)
+    
+    # Get date parameters
+    date_params = get_date_parameters()
+    
+    # Process all tables
+    results = []
+    for table_config in config["tables"]:
+        if not table_config["NUMERICAL_COLS"]:
+            print(f"Skipping {table_config['table_name']} - no numerical columns configured")
+            continue
+        
+        try:
+            df_result = process_table(spark, table_config, date_params)
+            if df_result:
+                results.append(df_result)
+        except Exception as e:
+            print(f"Error processing {table_config['table_name']}: {str(e)}")
+    
+    # Write all results to BigQuery
+    if results:
+        final_df = results[0]
+        for df in results[1:]:
+            final_df = final_df.union(df)
+        
+        final_df.write \
+            .format("bigquery") \
+            .option("table", RESULTS_TABLE) \
+            .mode("append") \
+            .save()
+
+if __name__ == "__main__":
+    main()
