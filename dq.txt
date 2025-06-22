@@ -126,8 +126,9 @@ if __name__ == "__main__":
 
 
 ###############
-# Melt to long format (date, kpi_name, daily_value)
-kpi_cols = [f"{col}_sum" for col in table_config["NUMERICAL_COLS"]]
-stack_expr = f"stack({len(kpi_cols)}, {', '.join([f'\"{c}\", {c}' for c in kpi_cols])}) as (kpi_name, daily_value)"
-df_long = df_daily.select(date_col, F.expr(stack_expr))
-    main()
+stack_parts = []
+for col in kpi_cols:
+    stack_parts.append(f"'{col}'")  # KPI name as string
+    stack_parts.append(col)         # Column reference
+    
+stack_expr = f"stack({len(kpi_cols)}, {', '.join(stack_parts)}) as (kpi_name, daily_value)"
