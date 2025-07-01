@@ -1,0 +1,53 @@
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+# 1. First calculate daily values for each KPI
+daily_agg = df.groupBy(date_col).agg(*[
+    F.sum(col).alias(f"{col}_sum") for col in numerical_cols
+])
+
+# 2. Melt to long format
+kpi_cols = [f"{col}_sum" for col in numerical_cols]
+stack_expr = f"stack({len(kpi_cols)}, {', '.join([f'\"{c}\", `{c}`' for c in kpi_cols])}) as (kpi_name, daily_value)"
+df_long = daily_agg.select(date_col, F.expr(stack_expr))
+
+# 3. Calculate proper Six Sigma metrics
+window_30d = Window.partitionBy("kpi_name").orderBy(F.col(date_col)).rowsBetween(-29, 0)
+
+sigma_calc = df_long.withColumn("moving_avg", F.avg("daily_value").over(window_30d)) \
+                   .withColumn("moving_range", F.col("daily_value") - F.lag("daily_value", 1).over(Window.partitionBy("kpi_name").orderBy(date_col)) \
+                   .withColumn("avg_moving_range", F.avg(F.abs("moving_range")).over(window_30d)) \
+                   .withColumn("sigma", F.col("avg_moving_range")/1.128) \  # d2 factor for n=2
+                   .withColumn("ucl", F.col("moving_avg") + 3*F.col("sigma")) \
+                   .withColumn("lcl", F.col("moving_avg") - 3*F.col("sigma")) \
+                   .withColumn("six_sigma_flag", 
+                       F.when(
+                           (F.col("daily_value") > F.col("ucl")) | 
+                           (F.col("daily_value") < F.col("lcl")), 1)
+                       .otherwise(0))
+
+# 4. Calculate daily comparison metrics
+window_prev = Window.partitionBy("kpi_name").orderBy(date_col)
+daily_comparison = sigma_calc.withColumn("prev_value", F.lag("daily_value", 1).over(window_prev)) \
+                            .withColumn("pct_diff", 
+                                F.when(
+                                    F.col("prev_value") != 0,
+                                    (F.col("daily_value") - F.col("prev_value"))/F.col("prev_value")*100
+                                ).otherwise(0)) \
+                            .withColumn("pct_diff_flag",
+                                F.when(F.abs(F.col("pct_diff")) > threshold_pct, 1).otherwise(0))
+
+# 5. Final output
+result = daily_comparison.filter(F.col(date_col) == today).select(
+    "kpi_name",
+    date_col,
+    "daily_value",
+    "prev_value",
+    "pct_diff",
+    "pct_diff_flag",
+    "moving_avg",
+    "sigma",
+    "ucl",
+    "lcl",
+    "six_sigma_flag"
+)
