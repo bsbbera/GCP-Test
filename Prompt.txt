@@ -1,0 +1,32 @@
+I need you to analyze complex SQL code and generate a detailed Source-Target Mapping (STM) document. Follow these guidelines:
+
+1. **Input**: I will provide SQL code with multiple joins, subqueries, CTEs, and transformations.
+
+2. **Output**: Generate a structured STM with these sections for each target column:
+
+   - **Target Table**: <final table name>
+   - **Target Column**: <column name>
+   - **Source System**: <source system/database if identifiable>
+   - **Source Table**: <original source table>
+   - **Source Column**: <original column>
+   - **Transformation Logic**: <detailed description of transformations applied>
+   - **Business Rule**: <any identifiable business logic>
+   - **Data Type Change**: <if any data type conversion occurs>
+   - **Join Condition**: <if this column is involved in joins>
+
+3. **Analysis Requirements**:
+   - Trace lineage through all intermediate steps (CTEs, subqueries, temp tables)
+   - Identify implicit transformations (e.g., date formatting, string manipulation)
+   - Note any aggregation functions (SUM, AVG, etc.)
+   - Highlight conditional logic (CASE statements, COALESCE, etc.)
+   - Preserve all aliases used in the original SQL
+
+4. **Presentation Format**:
+   ```markdown
+   ### Target Table: `orders_final`
+   
+   | Target Column | Source System | Source Table | Source Column | Transformation Logic |
+   |---------------|---------------|--------------|---------------|-----------------------|
+   | order_id      | ERP_PROD      | orders       | id            | Direct mapping        |
+   | order_total   | ERP_PROD      | order_items  | amount        | SUM(amount) grouped by order_id |
+   | customer_tier | CRM_PROD      | customers    | status        | CASE WHEN status IN ('GOLD','PLATINUM') THEN 'PREMIUM' ELSE 'STANDARD' END |
