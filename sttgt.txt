@@ -1,24 +1,22 @@
-As discussed yesterday, here are the key issues identified:
-
-Limited to .SQL Files
-Currently, all ADS development is done using .SQL files, which limits maintainability and modularization. Why aren’t we using tools like Informatica, dbt, or Prophecy that offer advanced features for end-to-end data pipeline management?
-
-No Python Deployment Support
-We cannot move Python or PySpark processes from DSW to production as there is no deployment support for these.
-
-Lack of Data Modeling Tools
-There is no tool to design and test data models, making workflow validation difficult.
-
-Impact:
-Creating FTR or similar tables in GCP is complex and unsustainable. We need an integrated platform that:
-
-Supports Python/PySpark deployment across environments
-
-Allows schema changes, backfilling, and workflow versioning
-
-Enables creation of Airflow DAGs for production pipelines
-
-Provides data modeling and pipeline design capabilities
-
-Summary:
-To build scalable, maintainable workflows and ensure smooth deployment, all relevant
+{
+  "task": "Extract data lineage from SQL file.",
+  "input": {
+    "sql_code": "<<< Place your SQL query here >>>"
+  },
+  "output_format": {
+    "lineage_table": [
+      {
+        "Target_kpi": "string - name of the final or intermediate column created",
+        "Source_kpi": "string or list - column(s) from which this KPI is derived",
+        "Source_table": "string or list - source table(s) used",
+        "Transformation_logic": "string - SQL logic, functions, joins, or expressions applied"
+      }
+    ]
+  },
+  "rules": [
+    "Include intermediate temp table columns as lineage steps.",
+    "Unpack complex expressions (CASE, COALESCE, aggregation, etc.) into the transformation logic.",
+    "If multiple sources contribute, list all of them.",
+    "Final table KPIs must trace back to original source tables."
+  ]
+}
