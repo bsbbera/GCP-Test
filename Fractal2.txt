@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-Fetch Cloud Run logs and turn them into one row per chatbot prompt.
-No gcloud, no bash. Just:
+Cloud Run chatbot eval extract — items 3, 4, 7, 8 only.
 
     pip install google-cloud-logging
-    python3 eval_runs.py --inspect          # what fields exist?
-    python3 eval_runs.py                    # produce the outputs
-    python3 eval_runs.py --from "17:35" --to "18:30"
-    python3 eval_runs.py --last 45          # last 45 minutes
-    python3 eval_runs.py --file run.json    # parse a saved file instead
+    python3 eval_runs.py --from "17:35"
+    python3 eval_runs.py --last 60
+    python3 eval_runs.py --file run.json
 
-Outputs: turns.csv, bq_queries.csv, turns.json
+Outputs:
+    turns.csv    one row per prompt  (model, times, tools, tokens, bytes, latency split)
+    stages.csv   one row per stage   (item 8, full detail)
 """
 
 import json
@@ -19,271 +18,256 @@ import csv
 import re
 import argparse
 from datetime import datetime, timedelta, timezone
-from collections import defaultdict
 
-# ------------------------------------------------------------------ config
 PROJECT = "ul-da-d-931978-prj"
 SERVICE = "search-copilot-agent"
 IST = timezone(timedelta(hours=5, minutes=30))
 
-SQL_KEYS = ["query", "sql", "query_text", "statement"]
-BYTE_KEYS = ["total_bytes_processed", "total_bytes_billed", "bytes_processed",
-             "bytes_scanned", "bytesProcessed", "bytes"]
-PROMPT_KEYS = ["query", "prompt", "user_query", "question", "message", "text"]
+BYTE_HINTS = ("bytes_processed", "bytes_billed", "bytes_scanned", "bytesprocessed")
 
 
-# ------------------------------------------------------------------ fetch
-def ist_dt(hhmm, day=None):
-    """'17:35' (today, IST) -> aware datetime."""
-    day = day or datetime.now(IST).date()
-    h, m = (int(x) for x in hhmm.split(":"))
-    return datetime(day.year, day.month, day.day, h, m, tzinfo=IST)
-
-
-def fetch(start, end=None, limit=5000):
+# ---------------------------------------------------------------- fetch
+def fetch(start, end, limit=5000):
     from google.cloud import logging_v2
-
     flt = (f'resource.type="cloud_run_revision" '
            f'resource.labels.service_name="{SERVICE}" '
            f'timestamp>="{start.astimezone(timezone.utc).isoformat()}"')
     if end:
         flt += f' timestamp<="{end.astimezone(timezone.utc).isoformat()}"'
-
     client = logging_v2.Client(project=PROJECT)
     out = []
-    for i, entry in enumerate(client.list_entries(
-            filter_=flt, order_by=logging_v2.ASCENDING, page_size=1000)):
-        out.append(entry.to_api_repr())   # same shape gcloud --format=json gives
+    for i, e in enumerate(client.list_entries(filter_=flt,
+                                              order_by=logging_v2.ASCENDING,
+                                              page_size=1000)):
+        out.append(e.to_api_repr())
         if i + 1 >= limit:
             break
-    print(f"[fetched {len(out)} entries since {start.astimezone(IST):%H:%M IST}]")
+    print(f"[{len(out)} log entries fetched]")
     return out
 
 
-# ------------------------------------------------------------------ helpers
-def ts(entry):
-    return datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00"))
+# ---------------------------------------------------------------- helpers
+def ts(e):
+    return datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
 
 
-def payload(entry):
-    p = entry.get("jsonPayload")
-    return p if isinstance(p, dict) else None
+def ev_and_extra(e):
+    """Return (event_text, extra_dict). Handles JSON and plain-text lines."""
+    p = e.get("jsonPayload")
+    if isinstance(p, dict):
+        extra = p.get("extra")
+        return str(p.get("event") or p.get("message") or ""), \
+            (extra if isinstance(extra, dict) else {})
+    return str(e.get("textPayload") or ""), {}
 
 
-def event_name(p):
-    return str(p.get("event") or p.get("message") or "")
+def num(v):
+    try:
+        return float(str(v).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
 
 
-def slug(name):
-    base = name.split(":", 1)[0]
-    return re.sub(r"[^a-z0-9]+", "_", base.lower()).strip("_")[:40]
-
-
-def flatten(prefix, obj, out):
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            flatten(f"{prefix}.{k}" if prefix else k, v, out)
-    elif isinstance(obj, list):
-        out[prefix] = json.dumps(obj)[:2000]
-    else:
-        out[prefix] = obj
-
-
-def first_key(d, cands):
-    low = {str(k).lower(): v for k, v in d.items()}
-    for k in cands:
-        v = low.get(k.lower())
-        if v not in (None, ""):
-            return v
+def find_num(extra, must_have, exclude=()):
+    """First numeric value whose key contains all of must_have."""
+    for k, v in extra.items():
+        kl = str(k).lower()
+        if all(w in kl for w in must_have) and not any(x in kl for x in exclude):
+            n = num(v)
+            if n is not None:
+                return n
     return None
 
 
-# ------------------------------------------------------------------ split
+# ---------------------------------------------------------------- split
 def split_turns(entries):
-    """Walk in order. Each POST starts a new turn. That's the whole algorithm."""
     entries = sorted(entries, key=ts)
     turns, cur = [], None
-    orphans = 0
-
     for e in entries:
         h = e.get("httpRequest") or {}
         if h.get("requestMethod") == "POST":
-            cur = {"ts": ts(e), "status": h.get("status"),
-                   "latency_s": round(float(str(h.get("latency", "0s"))
-                                            .rstrip("s")), 2),
-                   "url": h.get("requestUrl", ""), "logs": []}
+            lat = float(str(h.get("latency", "0s")).rstrip("s"))
+            cur = {"start": ts(e), "end": ts(e) + timedelta(seconds=lat),
+                   "total_s": round(lat, 2), "status": h.get("status"), "logs": []}
             turns.append(cur)
-        elif h:
-            continue                      # GET / health checks — ignore
-        elif cur is None:
-            orphans += 1                  # log lines before the first POST
-        else:
+        elif not h and cur is not None:
             cur["logs"].append(e)
-
-    if orphans:
-        print(f"[note] {orphans} log lines preceded the first POST — dropped]")
     if not turns:
-        sys.exit("No POST entries found. Widen the time window.")
+        sys.exit("No POST entries found — widen the time window.")
     return turns
 
 
-# ------------------------------------------------------------------ inspect
-def inspect(entries):
-    seen = defaultdict(lambda: defaultdict(list))
-    for e in entries:
-        p = payload(e)
-        if not p:
-            continue
-        ev = slug(event_name(p))
-        extra = p.get("extra")
-        flat = {}
-        if isinstance(extra, dict):
-            flatten("", extra, flat)
-        if not flat:
-            seen[ev]["(extra empty)"].append("")
-        for k, v in flat.items():
-            seen[ev][k].append(v)
+# ---------------------------------------------------------------- extract
+def build_stages(turn, idx):
+    """Item 8: named stages with real durations."""
+    marks = [(ts(e), *ev_and_extra(e)) for e in turn["logs"]]
+    stages = []
 
-    for ev in sorted(seen):
-        print(f"\n### {ev}")
-        for k in sorted(seen[ev]):
-            s = str(seen[ev][k][0])
-            print(f"    {k:38} = {s[:90] + ' …' if len(s) > 90 else s}")
+    # LLM: 'Sending out request' -> next 'ADK LLM call timing'
+    pending = None
+    for t, ev, _ in marks:
+        if "Sending out request" in ev:
+            pending = t
+        elif "ADK LLM call timing" in ev and pending:
+            stages.append(("llm_call", pending, t))
+            pending = None
+
+    # BigQuery: group of concurrent queries -> wall clock of the batch
+    bq_open, bq_last = None, None
+    for t, ev, _ in marks:
+        if "Executing BigQuery query" in ev:
+            if bq_open is None:
+                bq_open = t
+        elif "Query executed successfully" in ev and bq_open:
+            bq_last = t
+        elif "Sending out request" in ev and bq_open and bq_last:
+            stages.append(("bq_batch", bq_open, bq_last))
+            bq_open = bq_last = None
+    if bq_open and bq_last:
+        stages.append(("bq_batch", bq_open, bq_last))
+
+    # front and back of the request
+    if marks:
+        stages.append(("api_startup", turn["start"], marks[0][0]))
+        stages.append(("response_return", marks[-1][0], turn["end"]))
+
+    stages.sort(key=lambda s: s[1])
+    return [{"turn": idx, "stage": f"{n}_{i}" if n in ("llm_call", "bq_batch") else n,
+             "start": a.astimezone(IST).strftime("%H:%M:%S.%f")[:-3],
+             "end": b.astimezone(IST).strftime("%H:%M:%S.%f")[:-3],
+             "duration_s": round((b - a).total_seconds(), 3)}
+            for i, (n, a, b) in enumerate(stages, 1)]
 
 
-# ------------------------------------------------------------------ extract
 def summarize(turn, idx):
-    tools, bq, stages, ns = [], [], [], {}
-    prompt = None
+    tools, model = [], ""
+    prompt_tok = out_tok = total_tok = 0
+    llm_calls = 0
+    bq_queries = 0
+    bq_bytes = 0
+    bytes_seen = False
 
     for e in turn["logs"]:
-        p = payload(e)
-        if not p:
-            continue
-        ev = event_name(p)
-        stages.append((ts(e), ev[:70]))
+        ev, extra = ev_and_extra(e)
 
-        flat = {}
-        extra = p.get("extra")
-        if isinstance(extra, dict):
-            flatten("", extra, flat)
-
+        # item 3 — which tool was picked
         if ev.startswith("KPI tool invoked"):
             tools.append(ev.split(":", 1)[1].strip())
 
+        # model name
+        m = re.search(r"model:\s*([\w.\-]+)", ev)
+        if m and not model:
+            model = m.group(1)
+
+        # item 4 — tokens and call count
+        if "ADK LLM call timing" in ev:
+            llm_calls += 1
+            p = find_num(extra, ["prompt", "token"]) or \
+                find_num(extra, ["input", "token"])
+            o = find_num(extra, ["candidates", "token"]) or \
+                find_num(extra, ["output", "token"]) or \
+                find_num(extra, ["completion", "token"])
+            t = find_num(extra, ["total", "token"])
+            prompt_tok += p or 0
+            out_tok += o or 0
+            total_tok += t or 0
+
+        # item 7 — bytes scanned, only if the app actually logs it
         if "BigQuery" in ev or "Query executed" in ev:
-            sql, byts = first_key(flat, SQL_KEYS), first_key(flat, BYTE_KEYS)
-            if sql or byts:
-                bq.append({"turn": idx, "event": ev, "bytes": byts,
-                           "ms": first_key(flat, ["duration_ms", "elapsed_ms",
-                                                  "ms", "duration"]),
-                           "sql": sql})
+            if "Executing BigQuery query" in ev:
+                bq_queries += 1
+            for k, v in extra.items():
+                if any(h in str(k).lower() for h in BYTE_HINTS):
+                    n = num(v)
+                    if n is not None:
+                        bq_bytes += n
+                        bytes_seen = True
 
-        if prompt is None and "Querying agent" in ev:
-            prompt = first_key(flat, PROMPT_KEYS)
+    if not total_tok:
+        total_tok = prompt_tok + out_tok
 
-        for k, v in flat.items():
-            ns.setdefault(f"{slug(ev)}.{k}", []).append(v)
-
-    def collapse(vals):
-        u = list(dict.fromkeys(str(v) for v in vals))
-        return u[0] if len(u) == 1 else " | ".join(u)
-
-    return {"turn": idx,
-            "start_local": turn["ts"].astimezone(IST).strftime("%Y-%m-%d %H:%M:%S"),
-            "status": turn["status"], "latency_s": turn["latency_s"],
-            "prompt": prompt or "", "n_log_lines": len(turn["logs"]),
-            "n_tool_calls": len(tools), "tools": " | ".join(tools),
-            "n_bq_queries": len(bq), "bq": bq,
-            "extras": {k: collapse(v) for k, v in ns.items()},
-            "stages": stages}
-
-
-# ------------------------------------------------------------------ output
-def report(turns):
-    for s in turns:
-        print("=" * 72)
-        print(f"TURN {s['turn']}  {s['start_local']}  HTTP {s['status']}  "
-              f"{s['latency_s']}s  ({s['n_log_lines']} lines)")
-        if s["prompt"]:
-            print(f"  prompt: {str(s['prompt'])[:120]}")
-        print(f"  tools ({s['n_tool_calls']}): {s['tools'] or '-'}")
-        print(f"  bq queries: {s['n_bq_queries']}")
-        for q in s["bq"]:
-            sql = (str(q["sql"])[:100] + " …") if q["sql"] else "(sql not logged)"
-            print(f"     bytes={q['bytes']}  {sql}")
-        if s["extras"]:
-            print("  extras:")
-            for k, v in sorted(s["extras"].items()):
-                print(f"    {k:44} = {str(v)[:70]}")
-        if s["stages"]:
-            t0 = prev = s["stages"][0][0]
-            print("  timeline:")
-            for t, label in s["stages"]:
-                print(f"    +{(t-t0).total_seconds():7.2f}s "
-                      f"(Δ{(t-prev).total_seconds():6.2f}s)  {label}")
-                prev = t
-        print()
+    return {
+        "turn": idx,
+        "start_time": turn["start"].astimezone(IST).strftime("%Y-%m-%d %H:%M:%S"),
+        "end_time": turn["end"].astimezone(IST).strftime("%Y-%m-%d %H:%M:%S"),
+        "duration_s": turn["total_s"],
+        "status": turn["status"],
+        "model": model,
+        "n_tool_calls": len(tools),
+        "tools_used": " | ".join(tools),
+        "llm_call_count": llm_calls,
+        "prompt_tokens": int(prompt_tok),
+        "output_tokens": int(out_tok),
+        "total_tokens": int(total_tok),
+        "n_bq_queries": bq_queries,
+        "bq_bytes_scanned": int(bq_bytes) if bytes_seen else "",
+        "_bytes_seen": bytes_seen,
+    }
 
 
-def write_files(turns):
-    keys = sorted({k for s in turns for k in s["extras"]})
-    cols = ["turn", "start_local", "status", "latency_s", "prompt",
-            "n_tool_calls", "tools", "n_bq_queries", "n_log_lines"] + keys
-    with open("turns.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
-        w.writeheader()
-        for s in turns:
-            row = {c: s.get(c, "") for c in cols}
-            row.update({k: s["extras"].get(k, "") for k in keys})
-            w.writerow(row)
-
-    with open("bq_queries.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["turn", "event", "bytes", "ms", "sql"])
-        w.writeheader()
-        for s in turns:
-            w.writerows(s["bq"])
-
-    with open("turns.json", "w", encoding="utf-8") as f:
-        json.dump([{k: v for k, v in s.items() if k != "stages"} for s in turns],
-                  f, indent=2, default=str)
-
-    print(f"turns.csv ({len(turns)} turns, {len(keys)} extra cols) | "
-          f"bq_queries.csv ({sum(len(s['bq']) for s in turns)} queries) | turns.json")
-
-
-# ------------------------------------------------------------------ main
+# ---------------------------------------------------------------- output
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--from", dest="frm", help="IST start, e.g. 17:35")
     ap.add_argument("--to", dest="to", help="IST end, e.g. 18:30")
     ap.add_argument("--last", type=int, help="last N minutes")
-    ap.add_argument("--file", help="parse a saved JSON file instead of fetching")
-    ap.add_argument("--inspect", action="store_true")
-    ap.add_argument("--save", help="also dump raw entries to this path")
+    ap.add_argument("--file", help="parse a saved JSON file instead")
     a = ap.parse_args()
 
     if a.file:
         entries = json.load(open(a.file))
     else:
+        def at(hhmm):
+            d = datetime.now(IST).date()
+            h, m = (int(x) for x in hhmm.split(":"))
+            return datetime(d.year, d.month, d.day, h, m, tzinfo=IST)
         if a.last:
             start, end = datetime.now(IST) - timedelta(minutes=a.last), None
         elif a.frm:
-            start = ist_dt(a.frm)
-            end = ist_dt(a.to) if a.to else None
+            start, end = at(a.frm), at(a.to) if a.to else None
         else:
             start, end = datetime.now(IST) - timedelta(minutes=60), None
         entries = fetch(start, end)
-        if a.save:
-            json.dump(entries, open(a.save, "w"), indent=2)
 
-    if a.inspect:
-        inspect(entries)
-        return
+    raw = split_turns(entries)
+    rows = [summarize(t, i) for i, t in enumerate(raw, 1)]
+    stages = [s for i, t in enumerate(raw, 1) for s in build_stages(t, i)]
 
-    turns = [summarize(t, i) for i, t in enumerate(split_turns(entries), 1)]
-    report(turns)
-    write_files(turns)
+    keep_bytes = any(r.pop("_bytes_seen") for r in rows)
+    if not keep_bytes:
+        for r in rows:
+            r.pop("bq_bytes_scanned")
+        print("[bq_bytes_scanned not present in logs — column dropped]")
+
+    for r in rows:
+        print("-" * 66)
+        print(f"TURN {r['turn']}  {r['start_time']} -> {r['end_time'][-8:]}  "
+              f"{r['duration_s']}s  HTTP {r['status']}  {r['model']}")
+        print(f"  tools     : {r['tools_used'] or '-'}")
+        print(f"  llm       : {r['llm_call_count']} calls, "
+              f"{r['prompt_tokens']} in / {r['output_tokens']} out "
+              f"/ {r['total_tokens']} total")
+        line = f"  bigquery  : {r['n_bq_queries']} queries"
+        if keep_bytes:
+            line += f", {r['bq_bytes_scanned']} bytes"
+        print(line)
+        print("  stages    :")
+        for s in [s for s in stages if s["turn"] == r["turn"]]:
+            print(f"     {s['stage']:18} {s['duration_s']:8.3f}s  "
+                  f"{s['start']} -> {s['end']}")
+
+    with open("turns.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+
+    with open("stages.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["turn", "stage", "start", "end",
+                                          "duration_s"])
+        w.writeheader()
+        w.writerows(stages)
+
+    print(f"\nturns.csv ({len(rows)} turns) | stages.csv ({len(stages)} stages)")
 
 
 if __name__ == "__main__":
