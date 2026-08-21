@@ -1,0 +1,32 @@
+gcloud logging read \
+  'resource.type="cloud_run_revision"
+   resource.labels.service_name="search-copilot-agent"
+   timestamp>="2026-08-21T10:30:00Z"' \
+  --project=ul-da-d-931978-prj \
+  --format=json --order=asc --limit=2000 > run.json
+
+
+
+
+import json
+entries = json.load(open("run.json"))
+
+def is_post(e):
+    h = e.get("httpRequest") or {}
+    return h.get("requestMethod") == "POST"
+
+turns, cur = [], None
+for e in entries:
+    if is_post(e):
+        if cur: turns.append(cur)
+        cur = {"post": e, "logs": []}
+    elif cur is not None:
+        cur["logs"].append(e)
+if cur: turns.append(cur)
+
+
+from datetime import datetime, timedelta
+lat = float(e["httpRequest"]["latency"].rstrip("s"))
+end = datetime.fromisoformat(e["timestamp"].replace("Z","+00:00"))
+start = end - timedelta(seconds=lat)
+# bucket app logs where start <= ts <= end
