@@ -30,3 +30,168 @@ lat = float(e["httpRequest"]["latency"].rstrip("s"))
 end = datetime.fromisoformat(e["timestamp"].replace("Z","+00:00"))
 start = end - timedelta(seconds=lat)
 # bucket app logs where start <= ts <= end
+
+
+#!/usr/bin/env python3
+"""
+Parse Cloud Run logs (from `gcloud logging read --format=json`) into
+one row per chatbot prompt.
+
+Usage:
+    python3 parse_runs.py run.json
+    python3 parse_runs.py run.json --tz Asia/Kolkata
+"""
+
+import json
+import sys
+import csv
+from datetime import datetime, timedelta, timezone
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def ts(entry):
+    """Parse a log entry timestamp into an aware datetime."""
+    t = entry.get("timestamp", "")
+    return datetime.fromisoformat(t.replace("Z", "+00:00"))
+
+
+def flatten(prefix, obj, out):
+    """Flatten nested dicts so unknown `extra` keys still show up."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            flatten(f"{prefix}.{k}" if prefix else k, v, out)
+    elif isinstance(obj, list):
+        out[prefix] = ", ".join(str(x) for x in obj)
+    else:
+        out[prefix] = obj
+
+
+def load_turns(path):
+    """Bucket log entries into turns using POST request windows."""
+    entries = json.load(open(path))
+    entries.sort(key=ts)
+
+    posts = []
+    for e in entries:
+        h = e.get("httpRequest") or {}
+        if h.get("requestMethod") != "POST":
+            continue
+        end = ts(e)
+        lat = float(str(h.get("latency", "0s")).rstrip("s"))
+        posts.append({
+            "start": end - timedelta(seconds=lat),
+            "end": end,
+            "status": h.get("status"),
+            "url": h.get("requestUrl", ""),
+            "latency_s": round(lat, 2),
+            "logs": [],
+        })
+
+    if not posts:
+        sys.exit("No POST entries found. Widen the time window or raise --limit.")
+
+    # assign each app log to the POST window it falls inside
+    for e in entries:
+        if e.get("httpRequest"):
+            continue
+        t = ts(e)
+        for p in posts:
+            if p["start"] <= t <= p["end"]:
+                p["logs"].append(e)
+                break
+    return posts
+
+
+def summarize(turn, tz):
+    """Pull the metrics of interest out of one turn."""
+    tools, bq, extras = [], [], {}
+    stage_marks = []
+
+    for e in turn["logs"]:
+        p = e.get("jsonPayload")
+        if not isinstance(p, dict):
+            continue
+        ev = str(p.get("event", ""))
+        stage_marks.append((ts(e), ev or str(p.get("message", ""))[:60]))
+
+        if ev.startswith("KPI tool invoked"):
+            tools.append(ev.split(":", 1)[1].strip())
+        if "BigQuery query executed" in ev or "Query executed" in ev:
+            bq.append(ev)
+
+        extra = p.get("extra")
+        if isinstance(extra, dict) and extra:
+            flat = {}
+            flatten("", extra, flat)
+            for k, v in flat.items():
+                extras.setdefault(k, []).append(v)
+
+    return {
+        "start_local": turn["start"].astimezone(tz).strftime("%Y-%m-%d %H:%M:%S"),
+        "status": turn["status"],
+        "latency_s": turn["latency_s"],
+        "n_log_lines": len(turn["logs"]),
+        "n_tool_calls": len(tools),
+        "tools": " | ".join(tools),
+        "n_bq_queries": len(bq),
+        "extras": extras,
+        "stages": stage_marks,
+    }
+
+
+def main():
+    path = sys.argv[1] if len(sys.argv) > 1 else "run.json"
+    tz = IST
+
+    turns = [summarize(t, tz) for t in load_turns(path)]
+
+    # ---------- readable console report ----------
+    for i, s in enumerate(turns, 1):
+        print("=" * 70)
+        print(f"TURN {i}   {s['start_local']}   "
+              f"HTTP {s['status']}   {s['latency_s']}s total")
+        print(f"  tool calls ({s['n_tool_calls']}): {s['tools'] or '-'}")
+        print(f"  bigquery queries: {s['n_bq_queries']}")
+
+        if s["extras"]:
+            print("  extra fields found:")
+            for k, vals in sorted(s["extras"].items()):
+                shown = vals[0] if len(vals) == 1 else vals
+                print(f"    {k}: {shown}")
+        else:
+            print("  extra fields found: NONE (tokens/bytes not in logs)")
+
+        if s["stages"]:
+            print("  stage timeline:")
+            t0 = s["stages"][0][0]
+            prev = t0
+            for t, label in s["stages"]:
+                print(f"    +{(t - t0).total_seconds():7.2f}s "
+                      f"(Δ{(t - prev).total_seconds():6.2f}s)  {label}")
+                prev = t
+        print()
+
+    # ---------- CSV ----------
+    all_extra_keys = sorted({k for s in turns for k in s["extras"]})
+    cols = ["turn", "start_local", "status", "latency_s",
+            "n_tool_calls", "tools", "n_bq_queries"] + all_extra_keys
+
+    with open("turns.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for i, s in enumerate(turns, 1):
+            row = {c: s.get(c) for c in cols if c in s}
+            row["turn"] = i
+            for k in all_extra_keys:
+                vals = s["extras"].get(k, [])
+                row[k] = vals[0] if len(vals) == 1 else (
+                    " | ".join(str(v) for v in vals) if vals else "")
+            w.writerow(row)
+
+    print(f"Wrote turns.csv  ({len(turns)} turns, "
+          f"{len(all_extra_keys)} extra columns)")
+
+
+if __name__ == "__main__":
+    main()
