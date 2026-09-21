@@ -1,381 +1,109 @@
-#!/usr/bin/env python3
-"""
-Cloud Run chatbot eval extract.
-
-    pip install google-cloud-logging google-cloud-bigquery
-    python3 eval_runs.py --from "17:35"
-    python3 eval_runs.py --last 60
-    python3 eval_runs.py --file run.json --no-bq
-
-Outputs:
-    turns.csv     one row per prompt (prompt, model, tools, tokens, rows,
-                  exact BQ bytes, latency split by stage)
-    stages.csv    one row per stage, with the prompt alongside for validation
-    bq_jobs.csv   every BigQuery job matched to its turn
-"""
-
-import json
-import sys
-import csv
-import re
-import argparse
-from datetime import datetime, timedelta, timezone
-
-PROJECT = "ul-da-d-931978-prj"
-SERVICE = "search-copilot-agent"
-BQ_REGION = "region-us"          # us-central1 lives in the US multi-region
-IST = timezone(timedelta(hours=5, minutes=30))
-
-PROMPT_KEYS = ["query", "prompt", "user_query", "user_input", "question",
-               "message", "text", "input"]
-ROW_HINTS = ("row_count", "num_rows", "rows_returned", "n_rows", "rowcount",
-             "rows")
+DECLARE proj   STRING DEFAULT 'my-proj';
+DECLARE region STRING DEFAULT 'region-us';
+DECLARE ds     STRING DEFAULT NULL;        -- NULL = whole project
 
 
-# ---------------------------------------------------------------- fetch
-def fetch_logs(start, end, limit=5000):
-    from google.cloud import logging_v2
-    flt = (f'resource.type="cloud_run_revision" '
-           f'resource.labels.service_name="{SERVICE}" '
-           f'timestamp>="{start.astimezone(timezone.utc).isoformat()}"')
-    if end:
-        flt += f' timestamp<="{end.astimezone(timezone.utc).isoformat()}"'
-    client = logging_v2.Client(project=PROJECT)
-    out = []
-    for i, e in enumerate(client.list_entries(filter_=flt,
-                                              order_by=logging_v2.ASCENDING,
-                                              page_size=1000)):
-        out.append(e.to_api_repr())
-        if i + 1 >= limit:
-            break
-    print(f"[{len(out)} log entries fetched]")
-    return out
+DECLARE proj   STRING DEFAULT 'my-proj';
+DECLARE region STRING DEFAULT 'region-us';
+DECLARE ds     STRING DEFAULT 'sales';     -- your dataset
 
 
-def fetch_bq_jobs(start, end):
-    """Exact bytes per query, straight from BigQuery's own job history."""
-    from google.cloud import bigquery
-    client = bigquery.Client(project=PROJECT)
-    sql = f"""
-        SELECT job_id, creation_time, start_time, end_time,
-               total_bytes_processed, total_bytes_billed, total_slot_ms,
-               cache_hit, query
-        FROM `{BQ_REGION}`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
-        WHERE creation_time >= @s AND creation_time <= @e
-          AND job_type = 'QUERY'
-          AND statement_type != 'SCRIPT'
-        ORDER BY creation_time
-    """
-    cfg = bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("s", "TIMESTAMP", start),
-        bigquery.ScalarQueryParameter("e", "TIMESTAMP",
-                                      end or datetime.now(timezone.utc)),
-    ])
-    jobs = [dict(r) for r in client.query(sql, job_config=cfg).result()]
-    print(f"[{len(jobs)} BigQuery jobs found]")
-    return jobs
+DECLARE isq   STRING DEFAULT FORMAT('`%s.%s`.INFORMATION_SCHEMA', proj, region);
+DECLARE scope STRING DEFAULT CONCAT(proj, '.', IF(ds IS NULL, '', ds || '.'));
 
+-- 1. SETUP
+CREATE SCHEMA IF NOT EXISTS dq;
+CREATE TABLE IF NOT EXISTS dq.table_profile (
+  table_id STRING, total_rows INT64, dup_rows INT64, total_nulls INT64,
+  null_by_column STRING, error STRING, run_ts TIMESTAMP);
+DELETE FROM dq.table_profile WHERE STARTS_WITH(table_id, scope);
 
-# ---------------------------------------------------------------- helpers
-def ts(e):
-    return datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
+-- 2. TABLES IN SCOPE (columns picked automatically)
+EXECUTE IMMEDIATE FORMAT("""
+  CREATE OR REPLACE TABLE dq._work AS
+  SELECT c.table_catalog p, c.table_schema d, c.table_name t,
+    STRING_AGG(FORMAT('COUNTIF(`%%s` IS NULL) AS `%%s`', c.column_name, c.column_name), ', ') null_struct,
+    STRING_AGG(FORMAT('COUNTIF(`%%s` IS NULL)', c.column_name), ' + ') null_sum
+  FROM %s.COLUMNS c
+  JOIN %s.TABLES tb USING (table_catalog, table_schema, table_name)
+  WHERE tb.table_type = 'BASE TABLE' AND c.table_schema != 'dq'
+    AND (@ds IS NULL OR c.table_schema = @ds)
+  GROUP BY 1,2,3""", isq, isq)
+USING ds AS ds;
 
+-- 3. PROFILE EACH TABLE
+FOR rec IN (SELECT * FROM dq._work) DO
+  BEGIN
+    EXECUTE IMMEDIATE FORMAT("""
+      INSERT dq.table_profile
+      SELECT '%s.%s.%s', COUNT(*),
+             COUNT(*) - COUNT(DISTINCT TO_JSON_STRING(_src)),
+             %s, TO_JSON_STRING(STRUCT(%s)), NULL, CURRENT_TIMESTAMP()
+      FROM `%s.%s.%s` _src""",
+      rec.p, rec.d, rec.t, rec.null_sum, rec.null_struct, rec.p, rec.d, rec.t);
+  EXCEPTION WHEN ERROR THEN
+    INSERT dq.table_profile (table_id, error, run_ts)
+    VALUES (FORMAT('%s.%s.%s', rec.p, rec.d, rec.t), @@error.message, CURRENT_TIMESTAMP());
+  END;
+END FOR;
 
-def ev_and_extra(e):
-    p = e.get("jsonPayload")
-    if isinstance(p, dict):
-        x = p.get("extra")
-        return str(p.get("event") or p.get("message") or ""), \
-            (x if isinstance(x, dict) else {})
-    return str(e.get("textPayload") or ""), {}
+-- 4. COLLATED RESULT
+EXECUTE IMMEDIATE FORMAT("""
+CREATE OR REPLACE TABLE dq.data_completeness AS
+WITH meta AS (
+  SELECT CONCAT(project_id,'.',table_schema,'.',table_name) table_id,
+         creation_time, storage_last_modified_time
+  FROM %s.TABLE_STORAGE WHERE deleted = FALSE
+),
+cols AS (
+  SELECT CONCAT(table_catalog,'.',table_schema,'.',table_name) table_id, COUNT(*) col_count
+  FROM %s.COLUMNS GROUP BY 1
+),
+parts AS (
+  SELECT CONCAT(table_catalog,'.',table_schema,'.',table_name) table_id,
+         MIN(partition_id) first_partition, MAX(partition_id) last_partition,
+         COUNT(*) partition_count
+  FROM %s.PARTITIONS
+  WHERE partition_id NOT IN ('__NULL__','__UNPARTITIONED__')
+  GROUP BY 1
+),
+loads AS (
+  SELECT CONCAT(destination_table.project_id,'.',destination_table.dataset_id,'.',destination_table.table_id) table_id,
+         COUNT(*) loads_30d, MAX(creation_time) last_load,
+         SAFE_DIVIDE(TIMESTAMP_DIFF(MAX(creation_time), MIN(creation_time), HOUR), COUNT(*) - 1) avg_hrs
+  FROM %s.JOBS
+  WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+    AND state = 'DONE' AND error_result IS NULL
+    AND destination_table.table_id IS NOT NULL
+    AND (job_type = 'LOAD' OR statement_type IN ('INSERT','MERGE','UPDATE','CREATE_TABLE_AS_SELECT'))
+  GROUP BY 1
+)
+SELECT
+  SPLIT(m.table_id,'.')[OFFSET(1)] AS dataset,
+  m.table_id,
+  m.creation_time AS history_start,
+  m.storage_last_modified_time AS last_updated,
+  DATE_DIFF(CURRENT_DATE(), DATE(m.storage_last_modified_time), DAY) AS days_since_update,
+  p.first_partition, p.last_partition, p.partition_count,
+  l.loads_30d, l.last_load, ROUND(l.avg_hrs, 1) AS avg_hrs_between_loads,
+  CASE WHEN l.avg_hrs IS NULL THEN 'Unknown'
+       WHEN l.avg_hrs <= 1.5 THEN 'Hourly'
+       WHEN l.avg_hrs <= 30  THEN 'Daily'
+       WHEN l.avg_hrs <= 200 THEN 'Weekly'
+       ELSE 'Monthly+' END AS ingestion_frequency,
+  pr.total_rows, c.col_count,
+  pr.dup_rows, pr.dup_rows > 0 AS has_duplicates,
+  pr.total_nulls,
+  ROUND(100 * (1 - SAFE_DIVIDE(pr.total_nulls, pr.total_rows * c.col_count)), 2) AS completeness_pct,
+  pr.null_by_column, pr.error
+FROM meta m
+LEFT JOIN cols c USING (table_id)
+LEFT JOIN parts p USING (table_id)
+LEFT JOIN loads l USING (table_id)
+LEFT JOIN dq.table_profile pr USING (table_id)
+WHERE STARTS_WITH(m.table_id, @scope)
+  AND SPLIT(m.table_id,'.')[OFFSET(1)] != 'dq'
+""", isq, isq, isq, isq, isq)
+USING scope AS scope;
 
-
-def num(v):
-    try:
-        return float(str(v).replace(",", ""))
-    except (TypeError, ValueError):
-        return None
-
-
-def find_num(extra, must_have, exclude=()):
-    for k, v in extra.items():
-        kl = str(k).lower()
-        if all(w in kl for w in must_have) and not any(x in kl for x in exclude):
-            n = num(v)
-            if n is not None:
-                return n
-    return None
-
-
-# ---------------------------------------------------------------- split
-def split_turns(entries):
-    entries = sorted(entries, key=ts)
-    turns, cur = [], None
-    for e in entries:
-        h = e.get("httpRequest") or {}
-        if h.get("requestMethod") == "POST":
-            lat = float(str(h.get("latency", "0s")).rstrip("s"))
-            cur = {"start": ts(e), "end": ts(e) + timedelta(seconds=lat),
-                   "total_s": round(lat, 2), "status": h.get("status"),
-                   "url": h.get("requestUrl", ""), "logs": []}
-            turns.append(cur)
-        elif not h and cur is not None:
-            cur["logs"].append(e)
-    if not turns:
-        sys.exit("No POST entries found — widen the time window.")
-    return turns
-
-
-# ---------------------------------------------------------------- stages
-def build_stages(turn, idx):
-    marks = [(ts(e), *ev_and_extra(e)) for e in turn["logs"]]
-    raw = []
-
-    pending = None
-    for t, ev, _ in marks:
-        if "Sending out request" in ev:
-            pending = t
-        elif "ADK LLM call timing" in ev and pending:
-            raw.append(("llm_call", pending, t))
-            pending = None
-
-    bq_open = bq_last = None
-    for t, ev, _ in marks:
-        if "Executing BigQuery query" in ev and bq_open is None:
-            bq_open = t
-        elif "Query executed successfully" in ev and bq_open:
-            bq_last = t
-        elif "Sending out request" in ev and bq_open and bq_last:
-            raw.append(("bq_batch", bq_open, bq_last))
-            bq_open = bq_last = None
-    if bq_open and bq_last:
-        raw.append(("bq_batch", bq_open, bq_last))
-
-    if marks:
-        raw.append(("api_startup", turn["start"], marks[0][0]))
-        raw.append(("response_return", marks[-1][0], turn["end"]))
-
-    raw.sort(key=lambda s: s[1])
-    counter = {}
-    stages = []
-    for name, a, b in raw:
-        if name in ("llm_call", "bq_batch"):
-            counter[name] = counter.get(name, 0) + 1
-            label = f"{name}_{counter[name]}"
-        else:
-            label = name
-        stages.append({"turn": idx, "stage": label, "kind": name,
-                       "start": a.astimezone(IST).strftime("%H:%M:%S.%f")[:-3],
-                       "end": b.astimezone(IST).strftime("%H:%M:%S.%f")[:-3],
-                       "duration_s": round((b - a).total_seconds(), 3)})
-    return stages
-
-
-# ---------------------------------------------------------------- extract
-def summarize(turn, idx, stages):
-    tools, model, prompt = [], "", ""
-    prompt_tok = out_tok = total_tok = 0
-    llm_calls = bq_queries = 0
-    rows_fetched = 0
-    rows_seen = False
-
-    for e in turn["logs"]:
-        ev, extra = ev_and_extra(e)
-
-        if ev.startswith("KPI tool invoked"):
-            tools.append(ev.split(":", 1)[1].strip())
-
-        m = re.search(r"model:\s*([\w.\-]+)", ev)
-        if m and not model:
-            model = m.group(1)
-
-        # the user's prompt — only trust the agent-entry event, because a key
-        # named "query" on a BigQuery event is SQL, not the prompt
-        if not prompt and ("Querying agent" in ev or "Cache check" in ev):
-            low = {str(k).lower(): v for k, v in extra.items()}
-            for k in PROMPT_KEYS:
-                if low.get(k):
-                    prompt = str(low[k])
-                    break
-
-        if "ADK LLM call timing" in ev:
-            llm_calls += 1
-            prompt_tok += (find_num(extra, ["prompt", "token"]) or
-                           find_num(extra, ["input", "token"]) or 0)
-            out_tok += (find_num(extra, ["candidates", "token"]) or
-                        find_num(extra, ["output", "token"]) or
-                        find_num(extra, ["completion", "token"]) or 0)
-            total_tok += find_num(extra, ["total", "token"]) or 0
-
-        if "Executing BigQuery query" in ev:
-            bq_queries += 1
-        if "BigQuery" in ev or "Query executed" in ev:
-            for k, v in extra.items():
-                if any(h in str(k).lower() for h in ROW_HINTS):
-                    n = num(v)
-                    if n is not None:
-                        rows_fetched += n
-                        rows_seen = True
-                        break
-
-    if not total_tok:
-        total_tok = prompt_tok + out_tok
-
-    mine = [s for s in stages if s["turn"] == idx]
-
-    def bucket(kind):
-        return round(sum(s["duration_s"] for s in mine if s["kind"] == kind), 3)
-
-    lat_llm, lat_bq = bucket("llm_call"), bucket("bq_batch")
-    lat_api, lat_ret = bucket("api_startup"), bucket("response_return")
-
-    return {
-        "turn": idx,
-        "prompt": prompt,
-        "start_time": turn["start"].astimezone(IST).strftime("%Y-%m-%d %H:%M:%S"),
-        "end_time": turn["end"].astimezone(IST).strftime("%Y-%m-%d %H:%M:%S"),
-        "status": turn["status"],
-        "model": model,
-        "n_tool_calls": len(tools),
-        "tools_used": " | ".join(tools),
-        "llm_call_count": llm_calls,
-        "prompt_tokens": int(prompt_tok),
-        "output_tokens": int(out_tok),
-        "total_tokens": int(total_tok),
-        "n_bq_queries": bq_queries,
-        "rows_fetched": int(rows_fetched) if rows_seen else "",
-        "bq_jobs_matched": 0,
-        "bq_bytes_processed": "",
-        "bq_bytes_billed": "",
-        "bq_slot_ms": "",
-        "lat_total_s": turn["total_s"],
-        "lat_api_startup_s": lat_api,
-        "lat_llm_s": lat_llm,
-        "lat_bq_s": lat_bq,
-        "lat_response_return_s": lat_ret,
-        "lat_unaccounted_s": round(
-            turn["total_s"] - lat_llm - lat_bq - lat_api - lat_ret, 3),
-        "_start": turn["start"],
-        "_end": turn["end"],
-    }
-
-
-def attach_bq(rows, jobs):
-    """Assign each BigQuery job to the turn whose window contains it."""
-    matched = []
-    for j in jobs:
-        ct = j["creation_time"]
-        if ct.tzinfo is None:
-            ct = ct.replace(tzinfo=timezone.utc)
-        for r in rows:
-            if r["_start"] <= ct <= r["_end"]:
-                matched.append({
-                    "turn": r["turn"],
-                    "job_id": j["job_id"],
-                    "bytes_processed": j["total_bytes_processed"] or 0,
-                    "bytes_billed": j["total_bytes_billed"] or 0,
-                    "slot_ms": j["total_slot_ms"] or 0,
-                    "cache_hit": j.get("cache_hit"),
-                    "ms": int((j["end_time"] - j["start_time"]).total_seconds()
-                              * 1000) if j["start_time"] and j["end_time"] else "",
-                    "query": (j["query"] or "").replace("\n", " ")[:3000],
-                })
-                break
-    for r in rows:
-        mine = [m for m in matched if m["turn"] == r["turn"]]
-        r["bq_jobs_matched"] = len(mine)
-        if mine:
-            r["bq_bytes_processed"] = sum(m["bytes_processed"] for m in mine)
-            r["bq_bytes_billed"] = sum(m["bytes_billed"] for m in mine)
-            r["bq_slot_ms"] = sum(m["slot_ms"] for m in mine)
-    return matched
-
-
-# ---------------------------------------------------------------- main
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--from", dest="frm", help="IST start, e.g. 17:35")
-    ap.add_argument("--to", dest="to", help="IST end, e.g. 18:30")
-    ap.add_argument("--last", type=int, help="last N minutes")
-    ap.add_argument("--file", help="parse a saved JSON log dump")
-    ap.add_argument("--no-bq", action="store_true", help="skip the BigQuery join")
-    a = ap.parse_args()
-
-    def at(hhmm):
-        d = datetime.now(IST).date()
-        h, m = (int(x) for x in hhmm.split(":"))
-        return datetime(d.year, d.month, d.day, h, m, tzinfo=IST)
-
-    if a.last:
-        start, end = datetime.now(IST) - timedelta(minutes=a.last), None
-    elif a.frm:
-        start, end = at(a.frm), at(a.to) if a.to else None
-    else:
-        start, end = datetime.now(IST) - timedelta(minutes=60), None
-
-    entries = json.load(open(a.file)) if a.file else fetch_logs(start, end)
-    raw = split_turns(entries)
-
-    stages = [s for i, t in enumerate(raw, 1) for s in build_stages(t, i)]
-    rows = [summarize(t, i, stages) for i, t in enumerate(raw, 1)]
-
-    jobs = []
-    if not a.no_bq:
-        try:
-            lo = min(r["_start"] for r in rows) - timedelta(seconds=5)
-            hi = max(r["_end"] for r in rows) + timedelta(seconds=5)
-            jobs = attach_bq(rows, fetch_bq_jobs(lo, hi))
-        except Exception as exc:
-            print(f"[BigQuery join skipped: {type(exc).__name__}: "
-                  f"{str(exc)[:160]}]")
-            print("  (needs bigquery.jobs.listAll to see the service "
-                  "account's jobs, and BQ_REGION must match your datasets)")
-
-    prompts = {r["turn"]: r["prompt"] for r in rows}
-    for s in stages:
-        s["prompt"] = prompts.get(s["turn"], "")
-
-    for r in rows:
-        print("-" * 70)
-        print(f"TURN {r['turn']}  {r['start_time']} -> {r['end_time'][-8:]}  "
-              f"{r['lat_total_s']}s  HTTP {r['status']}  {r['model']}")
-        print(f"  prompt    : {r['prompt'][:110] or '(not in logs)'}")
-        print(f"  tools     : {r['tools_used'] or '-'}")
-        print(f"  llm       : {r['llm_call_count']} calls, "
-              f"{r['prompt_tokens']} in / {r['output_tokens']} out / "
-              f"{r['total_tokens']} total")
-        print(f"  bigquery  : {r['n_bq_queries']} queries, "
-              f"{r['bq_jobs_matched']} jobs, "
-              f"{r['bq_bytes_processed'] or '?'} bytes, "
-              f"{r['rows_fetched'] or '?'} rows")
-        print(f"  latency   : api {r['lat_api_startup_s']}s | "
-              f"llm {r['lat_llm_s']}s | bq {r['lat_bq_s']}s | "
-              f"return {r['lat_response_return_s']}s | "
-              f"other {r['lat_unaccounted_s']}s")
-
-    for r in rows:
-        r.pop("_start"), r.pop("_end")
-
-    with open("turns.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0]))
-        w.writeheader()
-        w.writerows(rows)
-
-    with open("stages.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["turn", "prompt", "stage", "kind",
-                                          "start", "end", "duration_s"])
-        w.writeheader()
-        w.writerows(stages)
-
-    if jobs:
-        with open("bq_jobs.csv", "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=list(jobs[0]))
-            w.writeheader()
-            w.writerows(jobs)
-
-    print(f"\nturns.csv ({len(rows)}) | stages.csv ({len(stages)}) | "
-          f"bq_jobs.csv ({len(jobs)})")
-
-
-if __name__ == "__main__":
-    main()
+SELECT * FROM dq.data_completeness ORDER BY dataset, completeness_pct;
