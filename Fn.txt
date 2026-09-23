@@ -1,49 +1,119 @@
-from google.oauth2.credentials import Credentials
-from google.cloud import datacatalog_lineage_v1
+WITH
+tbl AS (
+  SELECT CONCAT(table_catalog,'.',table_schema,'.',table_name) table_id,
+         table_catalog project_name, table_schema dataset_name, table_name,
+         table_type, creation_time
+  FROM `region-us`.INFORMATION_SCHEMA.TABLES
+),
+cols AS (
+  SELECT CONCAT(table_catalog,'.',table_schema,'.',table_name) table_id,
+         COUNT(*) column_count,
+         STRING_AGG(CONCAT(column_name,' (',data_type,')'), ', ' ORDER BY ordinal_position) column_list,
+         STRING_AGG(IF(is_partitioning_column = 'YES', column_name, NULL)) partition_column,
+         STRING_AGG(IF(clustering_ordinal_position IS NOT NULL, column_name, NULL), ', '
+                    ORDER BY clustering_ordinal_position) clustering_columns
+  FROM `region-us`.INFORMATION_SCHEMA.COLUMNS
+  GROUP BY 1
+),
+ds_opt AS (
+  SELECT CONCAT(catalog_name,'.',schema_name) ds_id,
+         MAX(IF(option_name = 'description', TRIM(option_value,'"'), NULL)) dataset_description,
+         MAX(IF(option_name = 'labels', option_value, NULL)) dataset_labels
+  FROM `region-us`.INFORMATION_SCHEMA.SCHEMATA_OPTIONS
+  GROUP BY 1
+),
+tbl_opt AS (
+  SELECT CONCAT(table_catalog,'.',table_schema,'.',table_name) table_id,
+         MAX(IF(option_name = 'description', TRIM(option_value,'"'), NULL)) table_description,
+         MAX(IF(option_name = 'labels', option_value, NULL)) table_labels,
+         MAX(IF(option_name = 'expiration_timestamp', option_value, NULL)) expiration
+  FROM `region-us`.INFORMATION_SCHEMA.TABLE_OPTIONS
+  GROUP BY 1
+),
+stor AS (
+  SELECT CONCAT(project_id,'.',table_schema,'.',table_name) table_id,
+         total_rows, total_partitions,
+         total_logical_bytes, active_logical_bytes, long_term_logical_bytes,
+         storage_last_modified_time
+  FROM `region-us`.INFORMATION_SCHEMA.TABLE_STORAGE
+  WHERE deleted = FALSE
+),
+jobs AS (
+  SELECT * FROM `region-us`.INFORMATION_SCHEMA.JOBS
+  WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 180 DAY)
+),
+reads AS (
+  SELECT CONCAT(rt.project_id,'.',rt.dataset_id,'.',rt.table_id) table_id,
+         COUNT(DISTINCT job_id) query_count_180d,
+         MAX(creation_time) last_queried,
+         COUNT(DISTINCT user_email) distinct_users,
+         ARRAY_TO_STRING(ARRAY_AGG(DISTINCT user_email IGNORE NULLS LIMIT 5), ', ') top_users,
+         COUNTIF(error_result IS NOT NULL) failed_queries
+  FROM jobs, UNNEST(referenced_tables) rt
+  WHERE job_type = 'QUERY'
+  GROUP BY 1
+),
+writes AS (
+  SELECT CONCAT(destination_table.project_id,'.',destination_table.dataset_id,'.',destination_table.table_id) table_id,
+         COUNTIF(error_result IS NULL) successful_loads_180d,
+         COUNTIF(error_result IS NOT NULL) failed_loads_180d,
+         MAX(IF(error_result IS NULL, creation_time, NULL)) last_load,
+         SAFE_DIVIDE(
+           TIMESTAMP_DIFF(MAX(IF(error_result IS NULL, creation_time, NULL)),
+                          MIN(IF(error_result IS NULL, creation_time, NULL)), HOUR),
+           COUNTIF(error_result IS NULL) - 1) avg_hrs_between_loads,
+         ARRAY_TO_STRING(ARRAY_AGG(DISTINCT user_email IGNORE NULLS LIMIT 3), ', ') writers,
+         ARRAY_AGG(error_result.message IGNORE NULLS ORDER BY creation_time DESC LIMIT 1)[SAFE_OFFSET(0)] last_error
+  FROM jobs
+  WHERE destination_table.table_id IS NOT NULL
+    AND (job_type IN ('LOAD','COPY')
+         OR statement_type IN ('INSERT','MERGE','UPDATE','DELETE','CREATE_TABLE_AS_SELECT'))
+  GROUP BY 1
+),
+edges AS (
+  SELECT DISTINCT
+    CONCAT(rt.project_id,'.',rt.dataset_id,'.',rt.table_id) src,
+    CONCAT(destination_table.project_id,'.',destination_table.dataset_id,'.',destination_table.table_id) dst
+  FROM jobs, UNNEST(referenced_tables) rt
+  WHERE destination_table.table_id IS NOT NULL
+    AND statement_type IN ('INSERT','MERGE','UPDATE','CREATE_TABLE_AS_SELECT')
+    AND error_result IS NULL
+),
+upstream   AS (SELECT dst table_id, STRING_AGG(src, ', ') upstream_tables   FROM edges WHERE src != dst GROUP BY 1),
+downstream AS (SELECT src table_id, STRING_AGG(dst, ', ') downstream_tables FROM edges WHERE src != dst GROUP BY 1)
 
-def get_upstream_lineage_with_token(project_id, location, target_table_fqn, access_token):
-    """
-    Fetches upstream tables using a raw OAuth Access Token.
-    """
-    # 1. Wrap the raw token string in a Credentials object
-    creds = Credentials(token=access_token)
-    
-    # 2. Initialize the client, explicitly passing the credentials
-    client = datacatalog_lineage_v1.LineageClient(credentials=creds)
-    
-    parent = f"projects/{project_id}/locations/{location}"
-    target_entity = datacatalog_lineage_v1.EntityReference(
-        fully_qualified_name=target_table_fqn
-    )
-    
-    request = datacatalog_lineage_v1.SearchLinksRequest(
-        parent=parent,
-        target=target_entity
-    )
-    
-    page_result = client.search_links(request=request)
-    
-    upstream_tables = []
-    print(f"Upstream lineage for: {target_table_fqn}\n" + "-"*50)
-    
-    for link in page_result:
-        source_fqn = link.source.fully_qualified_name
-        upstream_tables.append(source_fqn)
-        print(f"Source Table: {source_fqn}")
-        
-    return upstream_tables
-
-# --- Usage ---
-PROJECT_ID = "your-gcp-project-id"
-LOCATION = "us" # e.g., 'us' or 'eu'
-TARGET_FQN = "bigquery:your-gcp-project-id.your_dataset.your_table"
-
-# Paste your BigQuery Auth Access Token string here
-MY_ACCESS_TOKEN = "ya29.a0AfB_byC..." 
-
-immediate_sources = get_upstream_lineage_with_token(
-    project_id=PROJECT_ID, 
-    location=LOCATION, 
-    target_table_fqn=TARGET_FQN, 
-    access_token=MY_ACCESS_TOKEN
-)
+SELECT
+  t.project_name, t.dataset_name, t.table_name, t.table_type,
+  d.dataset_description, o.table_description,
+  c.column_count, c.column_list, c.partition_column, c.clustering_columns,
+  t.creation_time AS created_date,
+  s.storage_last_modified_time AS last_updated,
+  DATE_DIFF(CURRENT_DATE(), DATE(s.storage_last_modified_time), DAY) AS days_since_update,
+  s.total_rows AS row_count, s.total_partitions,
+  ROUND(s.total_logical_bytes / POW(1024,3), 3) AS total_gb,
+  ROUND(s.long_term_logical_bytes / POW(1024,3), 3) AS long_term_gb,
+  r.query_count_180d, r.last_queried, r.distinct_users, r.top_users, r.failed_queries,
+  w.successful_loads_180d, w.failed_loads_180d, w.last_load, w.last_error,
+  ROUND(w.avg_hrs_between_loads, 1) AS avg_hrs_between_loads,
+  CASE WHEN w.avg_hrs_between_loads IS NULL THEN 'Unknown'
+       WHEN w.avg_hrs_between_loads <= 1.5 THEN 'Hourly'
+       WHEN w.avg_hrs_between_loads <= 30  THEN 'Daily'
+       WHEN w.avg_hrs_between_loads <= 200 THEN 'Weekly'
+       ELSE 'Monthly+' END AS load_frequency,
+  u.upstream_tables, dn.downstream_tables,
+  COALESCE(REGEXP_EXTRACT(o.table_labels,  r'"owner", "([^"]+)"'),
+           REGEXP_EXTRACT(d.dataset_labels, r'"owner", "([^"]+)"')) AS owner_label,
+  w.writers, o.table_labels, o.expiration,
+  r.last_queried IS NULL AS is_unused_180d,
+  DATE_DIFF(CURRENT_DATE(), DATE(s.storage_last_modified_time), DAY) > 30 AS is_stale_30d,
+  o.table_description IS NOT NULL AS is_documented
+FROM tbl t
+LEFT JOIN cols c        USING (table_id)
+LEFT JOIN ds_opt d      ON d.ds_id = CONCAT(t.project_name,'.',t.dataset_name)
+LEFT JOIN tbl_opt o     USING (table_id)
+LEFT JOIN stor s        USING (table_id)
+LEFT JOIN reads r       USING (table_id)
+LEFT JOIN writes w      USING (table_id)
+LEFT JOIN upstream u    USING (table_id)
+LEFT JOIN downstream dn USING (table_id)
+ORDER BY t.dataset_name, t.table_name;
