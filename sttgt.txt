@@ -1,3 +1,5 @@
-pattern = r"(?:^|_)(?:backup|bkp|bak|temp|tmp|demo)(?:_|$)|\d{4}[-_]?\d{2}[-_]?\d{2}(?:[-_]?\d{2,6})?$|\d{2}[-_]?\d{2}[-_]?\d{4}$|\d{6,}$"
+pattern = r"(?i)(?:^|_)(?:backup|bkp|bak|temp|tmp|demo|test\d*|mock\w*|before\w*|after\w*|original|missing|miss|lastmodify|fullload|null|\d{4,}|\d{1,2}(?:st|nd|rd|th)?_?(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:_?\d{2,4})?|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*_?\d{1,4})(?=_|$)"
 
-clean = data[~data["table_name"].str.contains(pattern, case=False, regex=True, na=False)]
+mask = data["table_name"].str.contains(pattern, na=False)
+clean = data[~mask]
+removed = data[mask]
