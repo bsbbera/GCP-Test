@@ -1,12 +1,14 @@
-kw = "backup|bkp|bak|temp|tmp|demo|test|mock|before|after|original|missing|miss|lastmodify|fullload|null"
-mon = "jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec"
+kw     = "backup|bkp|bak|temp|tmp|demo|test|mock|before|after|original|missing|miss|lastmodify|fullload|null"
+exact  = "exp|cte|old|copy|dup|bkup|chg"          # whole part only, digits allowed after
+mon    = "jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec"
 
 pattern = (
     rf"(?i)(?:^|_)(?:"
-    rf"[a-z0-9]*(?:{kw})[a-z0-9]*"                                 # keyword with anything around it
-    rf"|\d{{4,}}"                                                  # 2025, 20260901, 3105
-    rf"|\d{{1,2}}(?:st|nd|rd|th)?_?(?:{mon})[a-z]*(?:_?\d{{2,4}})?"   # 1stJan2026, 13Jun, 06Feb_2024
-    rf"|(?:{mon})[a-z]*_?\d{{1,4}}"                                   # Jan2025, Sep_23
+    rf"[a-z0-9]*(?:{kw})[a-z0-9]*"
+    rf"|(?:{exact})\d*"
+    rf"|[a-z]*\d{{4,}}[a-z0-9]*"                                   # CHG0134220, 2025, 20260901
+    rf"|\d{{1,2}}(?:st|nd|rd|th)?_?(?:{mon})[a-z]*(?:_?\d{{2,4}})?"
+    rf"|(?:{mon})[a-z]*_?\d{{1,4}}"
     rf")(?=_|$)"
 )
 
