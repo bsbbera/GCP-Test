@@ -1,22 +1,3 @@
-{
-  "task": "Extract data lineage from SQL file.",
-  "input": {
-    "sql_code": "<<< Place your SQL query here >>>"
-  },
-  "output_format": {
-    "lineage_table": [
-      {
-        "Target_kpi": "string - name of the final or intermediate column created",
-        "Source_kpi": "string or list - column(s) from which this KPI is derived",
-        "Source_table": "string or list - source table(s) used",
-        "Transformation_logic": "string - SQL logic, functions, joins, or expressions applied"
-      }
-    ]
-  },
-  "rules": [
-    "Include intermediate temp table columns as lineage steps.",
-    "Unpack complex expressions (CASE, COALESCE, aggregation, etc.) into the transformation logic.",
-    "If multiple sources contribute, list all of them.",
-    "Final table KPIs must trace back to original source tables."
-  ]
-}
+pattern = r"(?:^|_)(?:backup|bkp|bak|temp|tmp|demo)(?:_|$)|\d{4}[-_]?\d{2}[-_]?\d{2}(?:[-_]?\d{2,6})?$|\d{2}[-_]?\d{2}[-_]?\d{4}$|\d{6,}$"
+
+clean = data[~data["table_name"].str.contains(pattern, case=False, regex=True, na=False)]
